@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datapilot-agent"
+version = "2.0.0"
+description = "DataPilot-Agent — Lean, glass-box, pure-Python native ReAct Data Analytics & Pro BI Agent"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Asahi230035" }]
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "python-multipart>=0.0.12",
+    "duckdb>=1.1.0",
+    "sqlglot>=25.24.0",
+    "charset-normalizer>=3.4.0",
+    "openpyxl>=3.1.5",
+    "python-calamine>=0.3.0",
+    "openai>=1.55.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Asahi230035/DataPilot-Agent"
+Repository = "https://github.com/Asahi230035/DataPilot-Agent"
+Issues = "https://github.com/Asahi230035/DataPilot-Agent/issues"
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008", "E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

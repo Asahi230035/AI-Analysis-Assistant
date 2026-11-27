@@ -1,0 +1,20 @@
+payment_id,order_id,payment_method,paid_amount,paid_at,payment_status
+P001,O1001,Alipay,1000,2025-01-10 10:12:00,success
+P002,O1001,Points,317,2025-01-10 10:12:05,success
+P003,O1002,WeChatPay,391,2025-01-15 14:20:00,success
+P004,O1003,CreditCard,2148,2025-01-22 09:05:00,success
+P005,O1004,WeChatPay,476,2025-02-03 18:44:00,success
+P006,O1005,Alipay,2299,2025-02-14 20:10:00,success
+P007,O1006,WeChatPay,471,2025-02-20 11:30:00,refunded
+P008,O1007,Alipay,798,2025-03-04 16:08:00,success
+P009,O1009,CreditCard,2448,2025-03-19 13:55:00,success
+P010,O1010,Alipay,2000,2025-03-27 19:22:00,success
+P011,O1010,WeChatPay,648,2025-03-27 19:22:10,success
+P012,O1011,Alipay,567,2025-04-06 08:40:00,success
+P013,O1012,WeChatPay,783,2025-04-15 15:18:00,success
+P014,O1013,WeChatPay,451,2025-04-21 17:02:00,success
+P015,O1014,Alipay,1519,2025-05-02 12:15:00,success
+P016,O1015,CreditCard,1498,2025-05-14 21:05:00,success
+P017,O1016,Alipay,617,2025-05-23 10:49:00,refunded
+P018,O1017,CreditCard,4698,2025-06-05 11:33:00,success
+P019,O1018,WeChatPay,669,2025-06-18 16:40:00,success
