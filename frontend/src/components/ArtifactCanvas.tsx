@@ -1,63 +1,77 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  ArrowUpRight,
   BarChart3,
+  Check,
   Code2,
   Download,
-  ExternalLink,
   FileCode2,
+  FileSearch,
   LayoutDashboard,
   Loader2,
-  Moon,
+  PanelRightClose,
   Pin,
-  Sparkles,
-  Sun,
   Table2,
-  Check,
+  TerminalSquare,
+  X,
 } from "lucide-react";
 import {
   api,
-  type DashboardDetail,
   type DashboardSummary,
   type QueryResultRecord,
+  type SourceDetail,
   type TurnArtifact,
   type TurnDetail,
 } from "../api/client";
 import { EChartsRenderer } from "./EChartsRenderer";
-import { ProDashboardGrid } from "./ProDashboardGrid";
 import { SqlCodeBlock } from "./SqlCodeBlock";
+import { SqlQueryWorkbench, type ExternalSqlPayload } from "./SqlQueryWorkbench";
 
 type ArtifactTab = "chart" | "table" | "sql";
+export type InspectorTab = "evidence" | "sql";
 
 interface ArtifactCanvasProps {
+  source?: SourceDetail | null;
   sourceId: string | null;
   dialect?: string;
   activeTurn: TurnDetail | null;
   liveArtifacts: TurnArtifact[];
   liveDashboardId: string | null;
   highlightedResultId: string | null;
+  highlightTick?: number;
+  activeTab: InspectorTab;
+  onTabChange: (tab: InspectorTab) => void;
+  externalSql?: ExternalSqlPayload | null;
   onOpenDashboardInLibrary?: (dashboardId: string) => void;
+  onClose?: () => void;
 }
 
 export function ArtifactCanvas({
+  source,
   sourceId,
   dialect = "duckdb",
   activeTurn,
   liveArtifacts,
   liveDashboardId,
   highlightedResultId,
+  highlightTick = 0,
+  activeTab,
+  onTabChange,
+  externalSql = null,
   onOpenDashboardInLibrary,
+  onClose,
 }: ArtifactCanvasProps) {
   const artifacts = liveArtifacts.length > 0 ? liveArtifacts : activeTurn?.artifacts || [];
   const dashboardId = liveDashboardId || activeTurn?.dashboard_id || null;
 
-  const [canvasMode, setCanvasMode] = useState<"dashboard" | "analysis">(
-    dashboardId ? "dashboard" : "analysis"
-  );
-  const [dashboard, setDashboard] = useState<DashboardDetail | null>(null);
-  const [loadingDash, setLoadingDash] = useState(false);
-
+  const [workbenchSql, setWorkbenchSql] = useState<ExternalSqlPayload | null>(externalSql);
   const [resultCache, setResultCache] = useState<Record<string, QueryResultRecord>>({});
   const [viewModes, setViewModes] = useState<Record<string, ArtifactTab>>({});
+
+  // Evidence preview drawer for non-charted [ref:res_xxx]
+  const [drawerResultId, setDrawerResultId] = useState<string | null>(null);
+  const [drawerTab, setDrawerTab] = useState<"table" | "sql">("table");
+  const [loadingDrawer, setLoadingDrawer] = useState(false);
 
   // Pin to dashboard popover
   const [pinTarget, setPinTarget] = useState<TurnArtifact | null>(null);
@@ -65,37 +79,38 @@ export function ArtifactCanvas({
   const [pinningId, setPinningId] = useState<string | null>(null);
   const [pinnedSuccess, setPinnedSuccess] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (dashboardId) {
-      setCanvasMode("dashboard");
-    } else {
-      setCanvasMode("analysis");
-    }
-  }, [dashboardId, activeTurn?.id]);
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
-  // Fetch dashboard preview when dashboardId changes
+  // SQL steps from current turn (useful as clickable raw evidence when no chart cards exist)
+  const sqlResultSteps = (activeTurn?.steps || []).filter(
+    (s) => Boolean(s.result_id && s.sql_text)
+  );
+
+  // Sync external SQL pushed from AgentTraceTimeline
   useEffect(() => {
-    if (!dashboardId) {
-      setDashboard(null);
+    if (!externalSql?.sql) return;
+    setWorkbenchSql(externalSql);
+    setDrawerResultId(null);
+    onTabChange("sql");
+  }, [externalSql?.tick]);
+
+  // Smooth scroll to referenced artifact OR open evidence drawer for un-charted result_id
+  useEffect(() => {
+    if (!highlightedResultId) return;
+    const hasArtifact = artifacts.some((a) => a.result_id === highlightedResultId);
+    onTabChange("evidence");
+    if (hasArtifact) {
+      setDrawerResultId(null);
+      setTimeout(() => {
+        const el = cardRefs.current[highlightedResultId];
+        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 60);
       return;
     }
-    let cancelled = false;
-    setLoadingDash(true);
-    api
-      .getDashboard(dashboardId)
-      .then((d) => {
-        if (!cancelled) setDashboard(d);
-      })
-      .catch(() => {
-        if (!cancelled) setDashboard(null);
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingDash(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [dashboardId]);
+
+    // Referenced result_id was produced by run_sql without render_chart -> inspect in drawer
+    openEvidenceDrawer(highlightedResultId);
+  }, [highlightedResultId, highlightTick]);
 
   // Hydrate artifacts missing inline rows
   useEffect(() => {
@@ -128,15 +143,26 @@ export function ArtifactCanvas({
     };
   }, [artifacts, resultCache]);
 
-  async function handleToggleTheme() {
-    if (!dashboard) return;
-    const nextTheme = dashboard.theme === "dark" ? "light" : "dark";
-    try {
-      const updated = await api.updateDashboard(dashboard.id, { theme: nextTheme });
-      setDashboard(updated);
-    } catch {
-      // ignore
+  function openEvidenceDrawer(resultId: string) {
+    setDrawerResultId(resultId);
+    setDrawerTab("table");
+    if (!resultCache[resultId]) {
+      setLoadingDrawer(true);
+      api
+        .getResult(resultId)
+        .then((rec) => {
+          setResultCache((prev) => ({ ...prev, [resultId]: rec }));
+        })
+        .catch(() => {})
+        .finally(() => setLoadingDrawer(false));
     }
+  }
+
+  function openSqlInWorkbench(sqlText: string, title?: string) {
+    if (!sqlText.trim()) return;
+    setWorkbenchSql({ sql: sqlText, title, tick: Date.now() });
+    setDrawerResultId(null);
+    onTabChange("sql");
   }
 
   async function openPinMenu(artifact: TurnArtifact) {
@@ -182,322 +208,472 @@ export function ArtifactCanvas({
     }
   }
 
-  const hasContent = Boolean(dashboardId || artifacts.length > 0);
+  const drawerRec = drawerResultId ? resultCache[drawerResultId] : null;
 
   return (
-    <div className="flex h-full flex-col bg-slate-50/70">
-      {/* Canvas Top Bar */}
+    <div className="relative flex h-full min-w-0 flex-col bg-slate-50/70">
+      {/* Inspector Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/90 bg-white px-4 py-2.5">
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">
-            {canvasMode === "dashboard" ? (
-              <LayoutDashboard className="h-4 w-4" />
-            ) : (
-              <BarChart3 className="h-4 w-4" />
+        <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs">
+          <button
+            type="button"
+            onClick={() => onTabChange("evidence")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+              activeTab === "evidence"
+                ? "bg-white text-indigo-600 shadow-2xs"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            <span>图表证据</span>
+            {artifacts.length > 0 && (
+              <span className="rounded-full bg-indigo-50 px-1.5 py-0.2 font-mono text-[10px] font-semibold text-indigo-600">
+                {artifacts.length}
+              </span>
             )}
-          </div>
-          <div>
-            <h3 className="text-xs font-semibold text-slate-900">
-              {canvasMode === "dashboard" ? "实时 12 列专业看板画布" : "实时多图分析证据画布"}
-            </h3>
-            <p className="text-[11px] text-slate-500">
-              {dashboardId && artifacts.length > 0
-                ? `已产出 1 份专业看板 · ${artifacts.length} 份图表证据`
-                : dashboardId
-                  ? "支持亮/暗大屏切换、AST 全局筛选与独立 HTML 导出"
-                  : artifacts.length > 0
-                    ? `共 ${artifacts.length} 份可溯源白盒结果`
-                    : "Agent 执行 SQL、图表与看板搭建后将在此实时呈现"}
-            </p>
-          </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => onTabChange("sql")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 font-medium transition ${
+              activeTab === "sql"
+                ? "bg-white text-indigo-600 shadow-2xs"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            <TerminalSquare className="h-3.5 w-3.5" />
+            <span>SQL 查询台</span>
+          </button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          {dashboardId && artifacts.length > 0 && (
-            <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs">
-              <button
-                type="button"
-                onClick={() => setCanvasMode("dashboard")}
-                className={`rounded-md px-2.5 py-1 font-medium transition ${
-                  canvasMode === "dashboard"
-                    ? "bg-white text-indigo-600 shadow-2xs"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                看板预览
-              </button>
-              <button
-                type="button"
-                onClick={() => setCanvasMode("analysis")}
-                className={`rounded-md px-2.5 py-1 font-medium transition ${
-                  canvasMode === "analysis"
-                    ? "bg-white text-indigo-600 shadow-2xs"
-                    : "text-slate-600 hover:text-slate-900"
-                }`}
-              >
-                图表证据 ({artifacts.length})
-              </button>
-            </div>
-          )}
-
-          {canvasMode === "dashboard" && dashboard && (
-            <>
-              <button
-                type="button"
-                onClick={() => void handleToggleTheme()}
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
-              >
-                {dashboard.theme === "dark" ? (
-                  <>
-                    <Sun className="h-3.5 w-3.5 text-amber-500" />
-                    亮色模式
-                  </>
-                ) : (
-                  <>
-                    <Moon className="h-3.5 w-3.5 text-indigo-500" />
-                    暗色大屏
-                  </>
-                )}
-              </button>
-              <a
-                href={api.dashboardHtmlExportUrl(dashboard.id)}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
-              >
-                <FileCode2 className="h-3.5 w-3.5 text-indigo-600" />
-                导出 HTML
-              </a>
-              {onOpenDashboardInLibrary && (
-                <button
-                  type="button"
-                  onClick={() => onOpenDashboardInLibrary(dashboard.id)}
-                  className="inline-flex items-center gap-1 rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-medium text-white shadow-xs transition hover:bg-indigo-500"
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                  在看板库打开
-                </button>
-              )}
-            </>
-          )}
-
-          {canvasMode === "analysis" && activeTurn?.id && artifacts.length > 0 && (
+        <div className="flex items-center gap-1.5">
+          {activeTab === "evidence" && activeTurn?.id && artifacts.length > 0 && (
             <a
               href={api.turnHtmlExportUrl(activeTurn.id)}
               target="_blank"
               rel="noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1 text-xs font-medium text-white shadow-xs transition hover:bg-indigo-500"
+              className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 transition hover:bg-slate-50"
             >
-              <FileCode2 className="h-3.5 w-3.5" />
-              导出独立 HTML 报告
+              <FileCode2 className="h-3.5 w-3.5 text-indigo-600" />
+              导出 HTML
             </a>
+          )}
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              title="收起右侧证据面板"
+              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+            >
+              <PanelRightClose className="h-4 w-4" />
+            </button>
           )}
         </div>
       </div>
 
-      {/* Canvas Body */}
+      {/* Inspector Body */}
       <div className="flex-1 overflow-y-auto p-4">
-        {!hasContent ? (
-          <div className="flex h-full flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300/90 bg-white/60 p-8 text-center">
-            <div className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
-              <Sparkles className="h-6 w-6" />
-            </div>
-            <h4 className="text-sm font-semibold text-slate-800">实时产物画布（Artifacts Canvas）</h4>
-            <p className="mt-1.5 max-w-sm text-xs leading-relaxed text-slate-500">
-              在左侧向 DataPilot-Agent 提问后，所有白盒 SQL 查询结果、多图可视化证据以及 AI 一键搭建的
-              12 列专业 BI 看板都将实时渲染在这里。
-            </p>
-          </div>
-        ) : canvasMode === "dashboard" ? (
-          loadingDash ? (
-            <div className="flex h-64 items-center justify-center gap-2 text-xs text-slate-500">
-              <Loader2 className="h-4 w-4 animate-spin text-indigo-600" />
-              正在加载专业 12 列看板...
-            </div>
-          ) : dashboard ? (
-            <div className="space-y-3">
-              <div className="flex items-baseline justify-between gap-2 px-1">
-                <div>
-                  <h2 className="text-base font-bold text-slate-900">{dashboard.name}</h2>
-                  {dashboard.description && (
-                    <p className="mt-0.5 text-xs text-slate-500">{dashboard.description}</p>
-                  )}
-                </div>
-                <span className="rounded-full bg-slate-200/70 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
-                  {dashboard.cards.length} 张卡片 · {dashboard.global_filters.length} 个全局筛选器
-                </span>
-              </div>
-              <ProDashboardGrid
-                dashboard={dashboard}
-                dialect={dialect}
-                onDashboardChange={setDashboard}
-              />
-            </div>
-          ) : (
-            <div className="py-16 text-center text-xs text-slate-500">无法加载看板预览</div>
-          )
+        {activeTab === "sql" ? (
+          <SqlQueryWorkbench
+            source={source || null}
+            activeTurn={activeTurn}
+            externalSql={workbenchSql}
+          />
         ) : (
           <div className="space-y-4">
-            {artifacts.map((art, index) => {
-              const cached = resultCache[art.result_id];
-              const columns = art.columns && art.columns.length > 0 ? art.columns : cached?.columns || [];
-              const rows = art.rows && art.rows.length > 0 ? art.rows : cached?.rows || [];
-              const sqlText = art.sql_text || cached?.sql_text || "";
-              const rowCount = art.row_count ?? cached?.row_count ?? rows.length;
-              const tabKey = `${art.result_id}_${index}`;
-              const mode: ArtifactTab = viewModes[tabKey] || (art.chart_spec ? "chart" : "table");
-              const isHighlighted = highlightedResultId === art.result_id;
-
-              return (
-                <div
-                  key={tabKey}
-                  className={`overflow-hidden rounded-2xl border bg-white shadow-xs transition ${
-                    isHighlighted
-                      ? "border-indigo-500 ring-2 ring-indigo-500/20"
-                      : "border-slate-200/90"
-                  }`}
+            {/* Compact redirect banner if this turn produced a dashboard (no embedded dashboard preview) */}
+            {dashboardId && onOpenDashboardInLibrary && (
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-violet-200/80 bg-violet-50/60 px-3.5 py-2.5">
+                <div className="flex min-w-0 items-center gap-2 text-xs text-violet-900">
+                  <LayoutDashboard className="h-4 w-4 shrink-0 text-violet-600" />
+                  <span className="truncate font-medium">
+                    本轮已生成专业看板（{dashboardId}），请前往「专业看板库」完整查看与交互
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onOpenDashboardInLibrary(dashboardId)}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-violet-600 px-2.5 py-1 text-[11px] font-medium text-white shadow-2xs transition hover:bg-violet-500"
                 >
-                  {/* Artifact Header */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <h4 className="truncate text-sm font-semibold text-slate-900">
-                          {art.title || art.chart_spec?.title || `分析结果 #${index + 1}`}
-                        </h4>
-                        <span className="rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
-                          {art.result_id}
-                        </span>
-                        <span className="text-[11px] text-slate-400">{rowCount} 行</span>
-                      </div>
-                    </div>
+                  <span>打开看板</span>
+                  <ArrowUpRight className="h-3 w-3" />
+                </button>
+              </div>
+            )}
 
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs">
-                        {art.chart_spec && (
+            {artifacts.length > 0 ? (
+              artifacts.map((art, index) => {
+                const cached = resultCache[art.result_id];
+                const columns =
+                  art.columns && art.columns.length > 0 ? art.columns : cached?.columns || [];
+                const rows = art.rows && art.rows.length > 0 ? art.rows : cached?.rows || [];
+                const sqlText = art.sql_text || cached?.sql_text || "";
+                const rowCount = art.row_count ?? cached?.row_count ?? rows.length;
+                const tabKey = `${art.result_id}_${index}`;
+                const mode: ArtifactTab = viewModes[tabKey] || (art.chart_spec ? "chart" : "table");
+                const isHighlighted = highlightedResultId === art.result_id;
+
+                return (
+                  <div
+                    key={tabKey}
+                    ref={(el) => {
+                      if (el && !cardRefs.current[art.result_id]) {
+                        cardRefs.current[art.result_id] = el;
+                      }
+                    }}
+                    className={`overflow-hidden rounded-2xl border bg-white shadow-xs transition-all duration-300 ${
+                      isHighlighted
+                        ? "border-indigo-500 ring-2 ring-indigo-500/25 shadow-md"
+                        : "border-slate-200/90"
+                    }`}
+                  >
+                    {/* Artifact Header */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <h4 className="truncate text-sm font-semibold text-slate-900">
+                            {art.title || art.chart_spec?.title || `分析结果 #${index + 1}`}
+                          </h4>
+                          <span className="rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
+                            {art.result_id}
+                          </span>
+                          <span className="text-[11px] text-slate-400">{rowCount} 行</span>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-xs">
+                          {art.chart_spec && (
+                            <button
+                              type="button"
+                              onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "chart" }))}
+                              className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
+                                mode === "chart"
+                                  ? "bg-white text-indigo-600 shadow-2xs"
+                                  : "text-slate-600 hover:text-slate-900"
+                              }`}
+                            >
+                              <BarChart3 className="h-3 w-3" />
+                              图表
+                            </button>
+                          )}
                           <button
                             type="button"
-                            onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "chart" }))}
+                            onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "table" }))}
                             className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
-                              mode === "chart"
+                              mode === "table"
                                 ? "bg-white text-indigo-600 shadow-2xs"
                                 : "text-slate-600 hover:text-slate-900"
                             }`}
                           >
-                            <BarChart3 className="h-3 w-3" />
-                            图表
+                            <Table2 className="h-3 w-3" />
+                            表格
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "sql" }))}
+                            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
+                              mode === "sql"
+                                ? "bg-white text-indigo-600 shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                          >
+                            <Code2 className="h-3 w-3" />
+                            SQL
+                          </button>
+                        </div>
+
+                        <a
+                          href={api.resultCsvUrl(art.result_id)}
+                          download
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
+                          title="下载 CSV"
+                        >
+                          <Download className="h-3 w-3" />
+                          CSV
+                        </a>
+
+                        {sourceId && (
+                          <button
+                            type="button"
+                            onClick={() => void openPinMenu(art)}
+                            className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium transition ${
+                              pinnedSuccess === art.result_id
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                : "border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-indigo-600"
+                            }`}
+                          >
+                            {pinnedSuccess === art.result_id ? (
+                              <>
+                                <Check className="h-3 w-3" />
+                                已固定
+                              </>
+                            ) : (
+                              <>
+                                <Pin className="h-3 w-3" />
+                                加入看板
+                              </>
+                            )}
                           </button>
                         )}
-                        <button
-                          type="button"
-                          onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "table" }))}
-                          className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
-                            mode === "table"
-                              ? "bg-white text-indigo-600 shadow-2xs"
-                              : "text-slate-600 hover:text-slate-900"
-                          }`}
-                        >
-                          <Table2 className="h-3 w-3" />
-                          表格
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setViewModes((p) => ({ ...p, [tabKey]: "sql" }))}
-                          className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition ${
-                            mode === "sql"
-                              ? "bg-white text-indigo-600 shadow-2xs"
-                              : "text-slate-600 hover:text-slate-900"
-                          }`}
-                        >
-                          <Code2 className="h-3 w-3" />
-                          SQL
-                        </button>
                       </div>
+                    </div>
 
-                      <a
-                        href={api.resultCsvUrl(art.result_id)}
-                        download
-                        className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"
-                        title="下载 CSV"
-                      >
-                        <Download className="h-3 w-3" />
-                        CSV
-                      </a>
-
-                      {sourceId && (
-                        <button
-                          type="button"
-                          onClick={() => void openPinMenu(art)}
-                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium transition ${
-                            pinnedSuccess === art.result_id
-                              ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                              : "border-slate-200 text-slate-600 hover:bg-slate-50 hover:text-indigo-600"
-                          }`}
-                        >
-                          {pinnedSuccess === art.result_id ? (
-                            <>
-                              <Check className="h-3 w-3" />
-                              已固定
-                            </>
-                          ) : (
-                            <>
-                              <Pin className="h-3 w-3" />
-                              加入看板
-                            </>
+                    {/* Artifact Body */}
+                    <div className="p-4">
+                      {mode === "chart" && art.chart_spec ? (
+                        <EChartsRenderer
+                          spec={art.chart_spec}
+                          rows={rows}
+                          theme="light"
+                          height={art.chart_spec.chart_type === "kpi_card" ? 132 : 290}
+                        />
+                      ) : mode === "sql" ? (
+                        <div className="space-y-2">
+                          {sqlText && (
+                            <div className="flex justify-end">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openSqlInWorkbench(sqlText, art.title || art.result_id)
+                                }
+                                className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
+                              >
+                                <TerminalSquare className="h-3 w-3" />
+                                送入 SQL 查询台调试
+                              </button>
+                            </div>
                           )}
-                        </button>
+                          <SqlCodeBlock sql={sqlText} dialect={dialect} />
+                        </div>
+                      ) : (
+                        <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
+                          <table className="w-full border-collapse text-left text-xs">
+                            <thead>
+                              <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                                {columns.map((col) => (
+                                  <th key={col} className="whitespace-nowrap px-3 py-2 font-medium">
+                                    {col}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-100">
+                              {rows.slice(0, 100).map((row, rIdx) => (
+                                <tr key={rIdx} className="hover:bg-slate-50/80">
+                                  {columns.map((col) => (
+                                    <td
+                                      key={col}
+                                      className="whitespace-nowrap px-3 py-1.5 font-mono text-[11.5px] text-slate-800"
+                                    >
+                                      {row[col] === null || row[col] === undefined
+                                        ? "—"
+                                        : String(row[col])}
+                                    </td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
                       )}
                     </div>
                   </div>
-
-                  {/* Artifact Body */}
-                  <div className="p-4">
-                    {mode === "chart" && art.chart_spec ? (
-                      <EChartsRenderer
-                        spec={art.chart_spec}
-                        rows={rows}
-                        theme="light"
-                        height={art.chart_spec.chart_type === "kpi_card" ? 132 : 300}
-                      />
-                    ) : mode === "sql" ? (
-                      <SqlCodeBlock sql={sqlText} dialect={dialect} />
-                    ) : (
-                      <div className="max-h-72 overflow-auto rounded-lg border border-slate-200">
-                        <table className="w-full border-collapse text-left text-xs">
-                          <thead>
-                            <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
-                              {columns.map((col) => (
-                                <th key={col} className="whitespace-nowrap px-3 py-2 font-medium">
-                                  {col}
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100">
-                            {rows.slice(0, 100).map((row, rIdx) => (
-                              <tr key={rIdx} className="hover:bg-slate-50/80">
-                                {columns.map((col) => (
-                                  <td
-                                    key={col}
-                                    className="whitespace-nowrap px-3 py-1.5 font-mono text-[11.5px] text-slate-800"
-                                  >
-                                    {row[col] === null || row[col] === undefined
-                                      ? "—"
-                                      : String(row[col])}
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                );
+              })
+            ) : sqlResultSteps.length > 0 ? (
+              /* Raw SQL evidence list when the turn ran SQL queries without render_chart */
+              <div className="space-y-2.5">
+                <div className="px-1 text-xs font-semibold text-slate-700">
+                  本轮落盘 SQL 原始证据（{sqlResultSteps.length} 份）
+                </div>
+                {sqlResultSteps.map((step, idx) => (
+                  <div
+                    key={step.id}
+                    className="rounded-2xl border border-slate-200/90 bg-white p-3.5 shadow-2xs"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-600">
+                          #{idx + 1}
+                        </span>
+                        <span className="truncate text-xs font-semibold text-slate-900">
+                          {step.title || `SQL 查询 #${step.step_index}`}
+                        </span>
+                        {step.result_id && (
+                          <span className="rounded bg-indigo-50 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-indigo-700">
+                            {step.result_id}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        {step.result_id && (
+                          <button
+                            type="button"
+                            onClick={() => openEvidenceDrawer(step.result_id!)}
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-700 transition hover:bg-slate-50"
+                          >
+                            <Table2 className="h-3 w-3 text-indigo-600" />
+                            查看明细
+                          </button>
+                        )}
+                        {step.sql_text && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              openSqlInWorkbench(
+                                step.sql_text!,
+                                step.title || step.result_id || undefined
+                              )
+                            }
+                            className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-indigo-50 px-2 py-1 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
+                          >
+                            <TerminalSquare className="h-3 w-3" />
+                            SQL 台运行
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {step.sql_text && (
+                      <div className="mt-2.5">
+                        <SqlCodeBlock sql={step.sql_text} dialect={dialect} compact />
                       </div>
                     )}
                   </div>
+                ))}
+              </div>
+            ) : (
+              <div className="flex min-h-[260px] flex-col items-center justify-center rounded-2xl border border-dashed border-slate-300/90 bg-white/70 p-8 text-center">
+                <div className="mb-3 flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+                  <BarChart3 className="h-5 w-5" />
                 </div>
-              );
-            })}
+                <h4 className="text-sm font-semibold text-slate-800">暂无图表证据</h4>
+                <p className="mt-1.5 max-w-xs text-xs leading-relaxed text-slate-500">
+                  当前轮次尚未产出可视化图表；点击对话中的{" "}
+                  <code className="rounded bg-slate-100 px-1 font-mono text-[11px]">res_xxx</code>{" "}
+                  角标可追溯原始数据，或切换到 SQL 查询台自行验证。
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onTabChange("sql")}
+                  className="mt-4 inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 px-3.5 py-1.5 text-xs font-medium text-white shadow-xs transition hover:bg-indigo-500"
+                >
+                  <TerminalSquare className="h-3.5 w-3.5" />
+                  打开 SQL 查询台
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>
+
+      {/* Slide-up Evidence Drawer for non-charted [ref:res_xxx] */}
+      {drawerResultId && (
+        <div className="absolute inset-x-4 bottom-4 z-30 flex max-h-[62%] flex-col overflow-hidden rounded-2xl border border-indigo-200 bg-white shadow-2xl">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-indigo-50/60 px-4 py-2.5">
+            <div className="flex items-center gap-2">
+              <FileSearch className="h-4 w-4 text-indigo-600" />
+              <span className="text-xs font-bold text-slate-900">白盒 SQL 原始证据</span>
+              <span className="rounded bg-white px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-indigo-700 ring-1 ring-indigo-200">
+                {drawerResultId}
+              </span>
+              {drawerRec && (
+                <span className="text-[11px] text-slate-500">共 {drawerRec.row_count} 行</span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="inline-flex rounded-lg bg-white p-0.5 text-[11px] ring-1 ring-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setDrawerTab("table")}
+                  className={`rounded-md px-2 py-0.5 font-medium ${
+                    drawerTab === "table" ? "bg-indigo-600 text-white" : "text-slate-600"
+                  }`}
+                >
+                  数据明细
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDrawerTab("sql")}
+                  className={`rounded-md px-2 py-0.5 font-medium ${
+                    drawerTab === "sql" ? "bg-indigo-600 text-white" : "text-slate-600"
+                  }`}
+                >
+                  白盒 SQL
+                </button>
+              </div>
+              {drawerRec?.sql_text && (
+                <button
+                  type="button"
+                  onClick={() => openSqlInWorkbench(drawerRec.sql_text, `证据 ${drawerResultId}`)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-indigo-200 bg-white px-2 py-1 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-50"
+                >
+                  <TerminalSquare className="h-3 w-3" />
+                  在 SQL 台运行
+                </button>
+              )}
+              <a
+                href={api.resultCsvUrl(drawerResultId)}
+                download
+                className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-50"
+              >
+                <Download className="h-3 w-3" />
+                CSV
+              </a>
+              <button
+                type="button"
+                onClick={() => setDrawerResultId(null)}
+                className="rounded-lg p-1 text-slate-400 hover:bg-white hover:text-slate-700"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-auto p-3.5">
+            {loadingDrawer ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-xs text-slate-500">
+                <Loader2 className="h-4 w-4 animate-spin text-indigo-600" />
+                正在加载查询证据 {drawerResultId}...
+              </div>
+            ) : !drawerRec ? (
+              <div className="py-8 text-center text-xs text-slate-400">
+                未找到结果 {drawerResultId} 的持久化记录
+              </div>
+            ) : drawerTab === "sql" ? (
+              <SqlCodeBlock sql={drawerRec.sql_text} dialect={dialect} compact />
+            ) : (
+              <div className="overflow-auto rounded-lg border border-slate-200">
+                <table className="w-full border-collapse text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
+                      {drawerRec.columns.map((c) => (
+                        <th key={c} className="whitespace-nowrap px-3 py-1.5 font-medium">
+                          {c}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {drawerRec.rows.slice(0, 80).map((row, idx) => (
+                      <tr key={idx} className="hover:bg-slate-50/80">
+                        {drawerRec.columns.map((c) => (
+                          <td
+                            key={c}
+                            className="whitespace-nowrap px-3 py-1.5 font-mono text-[11.5px] text-slate-800"
+                          >
+                            {row[c] === null || row[c] === undefined ? "—" : String(row[c])}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Pin-to-Dashboard Dialog */}
       {pinTarget && (
@@ -529,7 +705,9 @@ export function ArtifactCanvas({
                     <div className="font-medium text-slate-900">{d.name}</div>
                     <div className="text-[11px] text-slate-400">{d.card_count} 张卡片</div>
                   </div>
-                  {pinningId === d.id && <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" />}
+                  {pinningId === d.id && (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-600" />
+                  )}
                 </button>
               ))}
             </div>

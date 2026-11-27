@@ -78,6 +78,7 @@ export function DataPage({
 
   const [dictDraft, setDictDraft] = useState("");
   const [savingDict, setSavingDict] = useState(false);
+  const [generatingDict, setGeneratingDict] = useState(false);
   const [dictSaved, setDictSaved] = useState(false);
 
   useEffect(() => {
@@ -204,6 +205,26 @@ export function DataPage({
       setStatusMsg({ kind: "err", text: e instanceof Error ? e.message : "保存业务字典失败" });
     } finally {
       setSavingDict(false);
+    }
+  }
+
+  async function handleGenerateDictionary() {
+    if (!activeSource) return;
+    setGeneratingDict(true);
+    setStatusMsg(null);
+    try {
+      const res = await api.generateDictionary(activeSource.id);
+      if (res.dictionary_md) {
+        setDictDraft(res.dictionary_md);
+        setStatusMsg({
+          kind: "ok",
+          text: `已基于当前 ${activeSource.table_count} 张表结构生成业务字典草稿，确认微调后点击「保存业务字典」即可生效。`,
+        });
+      }
+    } catch (e) {
+      setStatusMsg({ kind: "err", text: e instanceof Error ? e.message : "AI 生成业务字典失败" });
+    } finally {
+      setGeneratingDict(false);
     }
   }
 
@@ -740,21 +761,36 @@ export function DataPage({
                     ))}
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={savingDict}
-                    onClick={() => void handleSaveDictionary()}
-                    className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs transition hover:bg-indigo-500 disabled:opacity-50"
-                  >
-                    {savingDict ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : dictSaved ? (
-                      <Check className="h-3.5 w-3.5" />
-                    ) : (
-                      <Save className="h-3.5 w-3.5" />
-                    )}
-                    {dictSaved ? "已保存" : "保存业务字典"}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={generatingDict}
+                      onClick={() => void handleGenerateDictionary()}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-1.5 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:opacity-50"
+                    >
+                      {generatingDict ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="h-3.5 w-3.5" />
+                      )}
+                      {generatingDict ? "AI 正在梳理表结构..." : "AI 生成字典草稿"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={savingDict}
+                      onClick={() => void handleSaveDictionary()}
+                      className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-1.5 text-xs font-semibold text-white shadow-xs transition hover:bg-indigo-500 disabled:opacity-50"
+                    >
+                      {savingDict ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : dictSaved ? (
+                        <Check className="h-3.5 w-3.5" />
+                      ) : (
+                        <Save className="h-3.5 w-3.5" />
+                      )}
+                      {dictSaved ? "已保存" : "保存业务字典"}
+                    </button>
+                  </div>
                 </div>
 
                 <textarea

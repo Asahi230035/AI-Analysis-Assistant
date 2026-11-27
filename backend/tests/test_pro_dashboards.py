@@ -327,3 +327,53 @@ def test_pro_dashboard_lifecycle_refresh_patch_theme_and_html_export(
     assert "__DASHBOARD_CHARTS__" in html_body
     assert "电商经营 Pro BI 看板" in html_body
     assert "华东" in html_body  # real DuckDB data embedded
+
+    # 6. Batch reorder cards endpoint
+    before_order = [c["id"] for c in client.get(f"/api/dashboards/{dash_id}").json()["cards"]]
+    reversed_order = list(reversed(before_order))
+    reorder_resp = client.put(
+        f"/api/dashboards/{dash_id}/cards/reorder",
+        json={"card_ids": reversed_order},
+    )
+    assert reorder_resp.status_code == 200
+    assert [c["id"] for c in reorder_resp.json()["cards"]] == reversed_order
+
+
+def test_ast_filter_preserves_left_join_and_uses_try_cast(demo_source: SourceDetail) -> None:
+    filters = [
+        GlobalFilterDef(
+            id="date_range",
+            label="下单日期",
+            filter_type="date_range",
+            target_table="orders",
+            target_column="order_date",
+        ),
+        GlobalFilterDef(
+            id="region",
+            label="大区",
+            filter_type="select",
+            target_table="customers",
+            target_column="region",
+        ),
+    ]
+    left_join_sql = (
+        "SELECT o.order_id, c.region FROM orders o "
+        "LEFT JOIN customers c ON o.customer_id = c.customer_id"
+    )
+    res = apply_dashboard_filters_ast(
+        sql=left_join_sql,
+        dialect="duckdb",
+        tables=demo_source.tables,
+        filter_defs=filters,
+        filter_values={"date_range": {"start": "2025-01-01"}, "region": "华东"},
+    )
+    assert "TRY_CAST" in res.sql.upper()
+    # Right-side LEFT JOIN predicate must live in ON clause rather than WHERE
+    upper_sql = res.sql.upper()
+    on_part = upper_sql.split("WHERE")[0] if "WHERE" in upper_sql else upper_sql
+    assert "C.REGION" in on_part
+    guard = validate_sql(res.sql, demo_source.tables, demo_source.relationships, dialect="duckdb")
+    assert guard.ok
+    qr = execute_readonly_sql("duckdb", demo_source.db_path, guard.normalized_sql)
+    # LEFT JOIN preserved: rows from orders outside 华东 still appear with NULL region
+    assert any(r["region"] is None for r in qr.rows)

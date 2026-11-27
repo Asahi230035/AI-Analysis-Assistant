@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY, source_id TEXT NOT NULL, title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS turns (
     id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, question TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'RUNNING', answer_md TEXT NOT NULL DEFAULT '',
-    artifacts_json TEXT NOT NULL DEFAULT '[]', dashboard_id TEXT, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE);
+    artifacts_json TEXT NOT NULL DEFAULT '[]', followups_json TEXT NOT NULL DEFAULT '[]', dashboard_id TEXT, prompt_tokens INTEGER NOT NULL DEFAULT 0, completion_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, error_message TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS agent_steps (
     id TEXT PRIMARY KEY, turn_id TEXT NOT NULL, step_index INTEGER NOT NULL, tool_name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', thought TEXT NOT NULL DEFAULT '',
     tool_args_json TEXT NOT NULL DEFAULT '{}', observation_json TEXT NOT NULL DEFAULT '{}', sql_text TEXT, result_id TEXT, status TEXT NOT NULL DEFAULT 'done', duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, FOREIGN KEY (turn_id) REFERENCES turns(id) ON DELETE CASCADE);
@@ -85,6 +85,12 @@ class Database:
     def init_schema(self) -> None:
         with self.connection() as conn:
             conn.executescript(SCHEMA_SQL)
+            # Lightweight idempotent migrations for existing SQLite databases
+            turn_cols = {r["name"] for r in self._all(conn, "PRAGMA table_info(turns)")}
+            if "cached_tokens" not in turn_cols:
+                conn.execute("ALTER TABLE turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
+            if "followups_json" not in turn_cols:
+                conn.execute("ALTER TABLE turns ADD COLUMN followups_json TEXT NOT NULL DEFAULT '[]'")
         try:
             os.chmod(self.db_path, 0o600)
         except OSError:
@@ -241,17 +247,31 @@ class Database:
 
     def update_turn(
         self, turn_id: str, *, status: str | None = None, answer_md: str | None = None, artifacts: list[dict[str, Any]] | None = None,
-        dashboard_id: str | None = None, prompt_tokens: int | None = None, completion_tokens: int | None = None, error_message: str | None = None,
+        followups: list[str] | None = None, dashboard_id: str | None = None, prompt_tokens: int | None = None,
+        completion_tokens: int | None = None, cached_tokens: int | None = None, error_message: str | None = None,
     ) -> dict[str, Any]:
         fields = _non_none(
             updated_at=utc_now(), status=status, answer_md=answer_md, dashboard_id=dashboard_id, error_message=error_message,
             artifacts_json=self._jdump(artifacts) if artifacts is not None else None,
+            followups_json=self._jdump(followups) if followups is not None else None,
             prompt_tokens=int(prompt_tokens) if prompt_tokens is not None else None,
             completion_tokens=int(completion_tokens) if completion_tokens is not None else None,
+            cached_tokens=int(cached_tokens) if cached_tokens is not None else None,
         )
         with self.connection() as conn:
             self._update(conn, "turns", turn_id, fields)
         return self.get_turn(turn_id)
+
+    def delete_turn_and_subsequent(self, conversation_id: str, turn_id: str) -> None:
+        with self.connection() as conn:
+            target = self._require(conn, "turns", turn_id, "分析轮次")
+            if target["conversation_id"] != conversation_id:
+                raise NotFoundError(f"轮次不属于当前会话: {turn_id}")
+            conn.execute(
+                "DELETE FROM turns WHERE conversation_id = ? AND created_at >= ?",
+                (conversation_id, target["created_at"]),
+            )
+            self._update(conn, "conversations", conversation_id, {"updated_at": utc_now()})
 
     def add_agent_step(
         self, turn_id: str, step_index: int, tool_name: str = "", title: str = "", thought: str = "",
@@ -286,7 +306,8 @@ class Database:
 
     @classmethod
     def _hydrate_turn(cls, row: sqlite3.Row, steps: list[dict[str, Any]]) -> dict[str, Any]:
-        return {**cls._hydrate(row, {"artifacts": list}, ("prompt_tokens", "completion_tokens")), "steps": steps}
+        d = cls._hydrate(row, {"artifacts": list, "followups": list}, ("prompt_tokens", "completion_tokens", "cached_tokens"))
+        return {**d, "steps": steps}
 
     # --- 3. Query Results ---
 
@@ -305,6 +326,27 @@ class Database:
     def get_query_result(self, result_id: str) -> dict[str, Any]:
         with self.connection() as conn:
             return self._hydrate(self._require(conn, "query_results", result_id, "查询结果"), {"columns": list, "rows": list, "facts": dict}, ("row_count",), ("truncated",))
+
+    def list_conversation_results(self, conversation_id: str, limit: int = 12) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = self._all(
+                conn,
+                "SELECT qr.id, qr.sql_text, qr.columns_json, qr.row_count, qr.created_at "
+                "FROM query_results qr INNER JOIN turns t ON qr.turn_id = t.id "
+                "WHERE t.conversation_id = ? AND t.status = 'COMPLETED' "
+                "ORDER BY qr.created_at DESC LIMIT ?",
+                (conversation_id, int(limit)),
+            )
+            return [
+                {
+                    "id": r["id"],
+                    "columns": self._jload(r["columns_json"], list),
+                    "row_count": int(r["row_count"] or 0),
+                    "sql_text": str(r["sql_text"] or ""),
+                    "created_at": r["created_at"],
+                }
+                for r in reversed(rows)
+            ]
 
     # --- 4. Pro BI Dashboards & 12-Column Cards ---
 
@@ -395,6 +437,19 @@ class Database:
             conn.execute("DELETE FROM dashboard_cards WHERE id = ?", (card_id,))
             self._update(conn, "dashboards", card["dashboard_id"], {"updated_at": utc_now()})
 
+    def reorder_dashboard_cards(self, dashboard_id: str, card_ids: list[str]) -> dict[str, Any]:
+        dash = self.get_dashboard(dashboard_id)
+        existing_ids = [c["id"] for c in dash["cards"]]
+        ordered = [cid for cid in card_ids if cid in existing_ids]
+        for cid in existing_ids:
+            if cid not in ordered:
+                ordered.append(cid)
+        with self.connection() as conn:
+            for idx, cid in enumerate(ordered):
+                conn.execute("UPDATE dashboard_cards SET position = ? WHERE id = ? AND dashboard_id = ?", (idx, cid, dashboard_id))
+            self._update(conn, "dashboards", dashboard_id, {"updated_at": utc_now()})
+        return self.get_dashboard(dashboard_id)
+
     @classmethod
     def _hydrate_dashboard_row(cls, row: sqlite3.Row) -> dict[str, Any]:
         return cls._hydrate(row, {"global_filters": list})
@@ -455,12 +510,17 @@ class Database:
 
     def get_usage_summary(self) -> dict[str, Any]:
         with self.connection() as conn:
-            t = self._one(conn, "SELECT COUNT(*) AS n, COALESCE(SUM(prompt_tokens), 0) AS pt, COALESCE(SUM(completion_tokens), 0) AS ct FROM turns")
+            t = self._one(conn, "SELECT COUNT(*) AS n, COALESCE(SUM(prompt_tokens), 0) AS pt, COALESCE(SUM(completion_tokens), 0) AS ct, COALESCE(SUM(cached_tokens), 0) AS cache_t FROM turns")
             s = self._one(conn, "SELECT COUNT(*) AS n, COALESCE(AVG(duration_ms), 0) AS avg_ms FROM agent_steps")
-            recent = self._all(conn, "SELECT id, question, status, prompt_tokens, completion_tokens, created_at FROM turns ORDER BY created_at DESC LIMIT 15")
+            recent = self._all(conn, "SELECT id, question, status, prompt_tokens, completion_tokens, cached_tokens, created_at FROM turns ORDER BY created_at DESC LIMIT 15")
             assert t is not None and s is not None
-            pt, ct = int(t["pt"]), int(t["ct"])
-            return {"turn_count": int(t["n"]), "step_count": int(s["n"]), "avg_step_ms": int(s["avg_ms"]), "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct, "recent_turns": [dict(r) for r in recent]}
+            pt, ct, cache_t = int(t["pt"]), int(t["ct"]), int(t["cache_t"])
+            hit_rate = round((cache_t / pt) * 100, 1) if pt > 0 else 0.0
+            return {
+                "turn_count": int(t["n"]), "step_count": int(s["n"]), "avg_step_ms": int(s["avg_ms"]),
+                "prompt_tokens": pt, "completion_tokens": ct, "cached_tokens": cache_t, "cache_hit_rate": hit_rate,
+                "total_tokens": pt + ct, "recent_turns": [dict(r) for r in recent],
+            }
 
     @classmethod
     def _present_profile(cls, row: sqlite3.Row) -> dict[str, Any]:

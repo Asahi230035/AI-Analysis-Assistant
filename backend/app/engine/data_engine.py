@@ -9,6 +9,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import duckdb
 
@@ -127,7 +128,7 @@ def introspect_sqlite(db_path: Path) -> tuple[list[TableMeta], list[Relationship
     if not resolved.exists() or not resolved.is_file():
         raise NotFoundError(f"SQLite 数据库文件不存在: {resolved}")
 
-    uri = f"file:{resolved}?mode=ro"
+    uri = f"file:{quote(str(resolved), safe='/:')}?mode=ro"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10.0)
         conn.execute("PRAGMA query_only = ON;")
@@ -188,9 +189,16 @@ def introspect_sqlite(db_path: Path) -> tuple[list[TableMeta], list[Relationship
 
             # Foreign key metadata
             for fk in conn.execute(f"PRAGMA foreign_key_list({q_tbl})").fetchall():
-                ref_table = fk[2]
-                from_col = fk[3]
-                to_col = fk[4]
+                ref_table = str(fk[2] or "")
+                from_col = str(fk[3] or "")
+                to_col = str(fk[4] or "")
+                if not ref_table or not from_col:
+                    continue
+                if not to_col:
+                    # Implicit PK reference in SQLite FK
+                    pk_rows = conn.execute(f"PRAGMA table_info({_quote_ident(ref_table)})").fetchall()
+                    pk_col = next((str(r[1]) for r in pk_rows if r[5]), "")
+                    to_col = pk_col or from_col
                 relationships.append(
                     RelationshipMeta(
                         left_table=ref_table,
@@ -244,7 +252,7 @@ def execute_readonly_sql(
             con.close()
 
     if dialect == "sqlite":
-        uri = f"file:{path.resolve()}?mode=ro"
+        uri = f"file:{quote(str(path.resolve()), safe='/:')}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=float(timeout_sec))
         conn.execute("PRAGMA query_only = ON;")
         deadline = time.monotonic() + max(1, timeout_sec)

@@ -11,6 +11,7 @@ import {
   LayoutDashboard,
   Loader2,
   Search,
+  TerminalSquare,
   XCircle,
 } from "lucide-react";
 import type { AgentStep } from "../api/client";
@@ -46,6 +47,11 @@ const TOOL_META: Record<string, ToolVisualMeta> = {
   build_dashboard: {
     label: "构建 12 列看板",
     badgeClass: "bg-violet-50 text-violet-700 ring-1 ring-violet-200",
+    icon: LayoutDashboard,
+  },
+  update_dashboard: {
+    label: "增量更新看板",
+    badgeClass: "bg-fuchsia-50 text-fuchsia-700 ring-1 ring-fuchsia-200",
     icon: LayoutDashboard,
   },
 };
@@ -91,6 +97,7 @@ interface AgentTraceTimelineProps {
   defaultExpanded?: boolean;
   dialect?: string;
   onSelectResultId?: (resultId: string) => void;
+  onOpenSqlInWorkbench?: (sql: string, title?: string) => void;
 }
 
 export function AgentTraceTimeline({
@@ -99,6 +106,7 @@ export function AgentTraceTimeline({
   defaultExpanded = false,
   dialect = "duckdb",
   onSelectResultId,
+  onOpenSqlInWorkbench,
 }: AgentTraceTimelineProps) {
   const [timelineOpen, setTimelineOpen] = useState(defaultExpanded || isStreaming);
   const [expandedSteps, setExpandedSteps] = useState<Record<string, boolean>>({});
@@ -239,7 +247,27 @@ export function AgentTraceTimeline({
                 {isOpen && expandable && (
                   <div className="mt-2.5 ml-7 space-y-2">
                     {step.sql_text && (
-                      <SqlCodeBlock sql={step.sql_text} dialect={dialect} compact />
+                      <div className="space-y-1.5">
+                        {onOpenSqlInWorkbench && (
+                          <div className="flex justify-end">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenSqlInWorkbench(
+                                  step.sql_text!,
+                                  step.title || step.result_id || `Step ${step.step_index}`
+                                );
+                              }}
+                              className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50/70 px-2 py-0.5 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
+                            >
+                              <TerminalSquare className="h-3 w-3" />
+                              在右侧 SQL 台编辑运行
+                            </button>
+                          </div>
+                        )}
+                        <SqlCodeBlock sql={step.sql_text} dialect={dialect} compact />
+                      </div>
                     )}
                     {hasArgs && (
                       <div className="rounded-lg border border-slate-200 bg-slate-50 p-2">

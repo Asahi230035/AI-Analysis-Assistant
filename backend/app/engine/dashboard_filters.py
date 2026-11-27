@@ -31,11 +31,12 @@ def _extract_direct_tables(
     select_node: exp.Select,
     cte_names: set[str],
     allowed_tables: set[str],
-) -> dict[str, list[str]]:
-    """Collect physical tables directly referenced in a SELECT's FROM and JOIN clauses."""
+) -> tuple[dict[str, list[str]], dict[str, exp.Join]]:
+    """Collect physical tables in FROM/JOIN plus a map of nullable LEFT/FULL JOIN aliases."""
     refs: dict[str, list[str]] = {}
+    outer_join_by_alias: dict[str, exp.Join] = {}
 
-    def _register(node: exp.Expression | None) -> None:
+    def _register(node: exp.Expression | None, outer_join: exp.Join | None = None) -> None:
         if not isinstance(node, exp.Table):
             return
         tname = (node.name or "").lower()
@@ -45,6 +46,8 @@ def _extract_direct_tables(
         aliases = refs.setdefault(tname, [])
         if alias not in aliases:
             aliases.append(alias)
+        if outer_join is not None:
+            outer_join_by_alias[alias] = outer_join
 
     from_clause = select_node.args.get("from_")
     if from_clause is not None:
@@ -53,20 +56,27 @@ def _extract_direct_tables(
             _register(extra)
 
     for join in select_node.args.get("joins") or []:
-        _register(join.this)
+        side = str(join.args.get("side") or "").upper()
+        is_nullable_right = side in {"LEFT", "FULL"}
+        _register(join.this, outer_join=join if is_nullable_right else None)
 
-    return refs
+    return refs, outer_join_by_alias
 
 
 def _build_predicate(
     col_expr: exp.Column,
     fdef: GlobalFilterDef,
     normalized_val: Any,
+    sg_dialect: str = "duckdb",
 ) -> exp.Expression | None:
     """Construct a pure SQLGlot AST predicate node with strict literal typing."""
     if fdef.filter_type == "date_range":
         start_s, end_s = normalized_val
-        date_col = exp.Cast(this=col_expr.copy(), to=exp.DataType.build("DATE"))
+        date_col: exp.Expression = (
+            exp.TryCast(this=col_expr.copy(), to=exp.DataType.build("DATE"))
+            if sg_dialect == "duckdb"
+            else exp.Cast(this=col_expr.copy(), to=exp.DataType.build("DATE"))
+        )
         parts: list[exp.Expression] = []
         if start_s:
             parts.append(
@@ -226,7 +236,7 @@ def apply_dashboard_filters_ast(
     applied_set: set[str] = set()
 
     for select_node in tree.find_all(exp.Select):
-        referenced = _extract_direct_tables(select_node, cte_names, allowed_tables)
+        referenced, outer_join_by_alias = _extract_direct_tables(select_node, cte_names, allowed_tables)
         if not referenced:
             continue
 
@@ -252,9 +262,14 @@ def apply_dashboard_filters_ast(
                     this=_make_ident(canonical_col),
                     table=_make_ident(alias),
                 )
-                predicate = _build_predicate(col_expr, fdef, norm_val)
+                predicate = _build_predicate(col_expr, fdef, norm_val, sg_dialect=sg_dialect)
                 if predicate is not None:
-                    select_node.where(predicate, append=True, copy=False)
+                    # Preserve LEFT/FULL JOIN semantics: attach predicate to JOIN ON instead of WHERE
+                    outer_join = outer_join_by_alias.get(alias)
+                    if outer_join is not None and outer_join.args.get("on") is not None:
+                        outer_join.set("on", exp.and_(outer_join.args["on"], predicate))
+                    else:
+                        select_node.where(predicate, append=True, copy=False)
                     applied_set.add(fdef.id)
 
     for fdef, _ in active_specs:

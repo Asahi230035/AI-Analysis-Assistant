@@ -12,6 +12,8 @@ import {
   Square,
   Sun,
   Trash2,
+  Wand2,
+  Zap,
 } from "lucide-react";
 import {
   api,
@@ -42,6 +44,8 @@ interface DashboardsPageProps {
   initialDashboardId: string | null;
   onConsumeInitialDashboardId: () => void;
   onGoDataPage: () => void;
+  onDrillDownToWorkspace?: (prompt: string) => void;
+  onUsageChanged?: () => void;
 }
 
 export function DashboardsPage({
@@ -49,16 +53,22 @@ export function DashboardsPage({
   initialDashboardId,
   onConsumeInitialDashboardId,
   onGoDataPage,
+  onDrillDownToWorkspace,
+  onUsageChanged,
 }: DashboardsPageProps) {
   const [dashboards, setDashboards] = useState<DashboardSummary[]>([]);
   const [activeDashboard, setActiveDashboard] = useState<DashboardDetail | null>(null);
+  const [activeFilters, setActiveFilters] = useState<Record<string, unknown>>({});
   const [loadingList, setLoadingList] = useState(false);
 
-  // AI one-click generator state
+  // AI studio mode: create new dashboard OR incrementally edit active dashboard
+  const [aiMode, setAiMode] = useState<"create" | "edit">("create");
   const [prompt, setPrompt] = useState("");
   const [genTheme, setGenTheme] = useState<DashboardTheme>("dark");
   const [isGenerating, setIsGenerating] = useState(false);
   const [genSteps, setGenSteps] = useState<AgentStep[]>([]);
+  const [lastGenTokens, setLastGenTokens] = useState<number>(0);
+  const [lastGenCachePct, setLastGenCachePct] = useState<number>(0);
   const [genError, setGenError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -84,6 +94,7 @@ export function DashboardsPage({
         setActiveDashboard(detail);
       } else {
         setActiveDashboard(null);
+        setAiMode("create");
       }
     } catch {
       setDashboards([]);
@@ -104,6 +115,7 @@ export function DashboardsPage({
     try {
       const detail = await api.getDashboard(id);
       setActiveDashboard(detail);
+      setActiveFilters({});
     } catch {
       // ignore
     }
@@ -115,7 +127,7 @@ export function DashboardsPage({
       const created = await api.createDashboard({
         source_id: activeSource.id,
         name: `${activeSource.name} · 自定义看板`,
-        description: "可从工作台固定卡片或使用 AI 一键生成",
+        description: "可从工作台固定卡片或使用 AI 一键生成 / 增量修改",
         theme: "light",
       });
       await loadDashboards(created.id);
@@ -138,7 +150,8 @@ export function DashboardsPage({
     const nextTheme: DashboardTheme = activeDashboard.theme === "dark" ? "light" : "dark";
     try {
       const updated = await api.updateDashboard(activeDashboard.id, { theme: nextTheme });
-      setActiveDashboard(updated);
+      // Preserve currently filtered cards if any filters are active
+      setActiveDashboard((prev) => (prev ? { ...prev, theme: updated.theme } : updated));
       setDashboards((prev) =>
         prev.map((d) => (d.id === updated.id ? { ...d, theme: updated.theme } : d))
       );
@@ -151,7 +164,9 @@ export function DashboardsPage({
     if (!activeDashboard) return;
     setRefreshingAll(true);
     try {
-      const updated = await api.refreshDashboard(activeDashboard.id, {});
+      const updated = await api.refreshDashboard(activeDashboard.id, {
+        filter_values: activeFilters,
+      });
       setActiveDashboard(updated);
     } catch (e) {
       setGenError(e instanceof Error ? e.message : "刷新看板失败");
@@ -166,60 +181,74 @@ export function DashboardsPage({
     setIsGenerating(false);
   }
 
-  async function handleAiGenerate(overridePrompt?: string) {
+  async function handleAiSubmit(overridePrompt?: string, forceMode?: "create" | "edit") {
     const text = (overridePrompt ?? prompt).trim();
+    const mode = forceMode || (aiMode === "edit" && activeDashboard ? "edit" : "create");
     if (!text || !activeSource || isGenerating) return;
 
     setPrompt(text);
     setIsGenerating(true);
     setGenSteps([]);
+    setLastGenTokens(0);
+    setLastGenCachePct(0);
     setGenError(null);
     const controller = new AbortController();
     abortRef.current = controller;
 
-    let generatedId: string | null = null;
-    try {
-      await api.streamGenerateDashboard(
-        { source_id: activeSource.id, prompt: text, theme: genTheme },
-        {
-          onStep: (step) => {
-            setGenSteps((prev) => {
-              const idx = prev.findIndex((s) => s.id === step.id);
-              if (idx >= 0) {
-                const copy = [...prev];
-                copy[idx] = step;
-                return copy;
-              }
-              return [...prev, step];
-            });
-          },
-          onCanvas: (ev) => {
-            if (ev.kind === "dashboard" && ev.dashboard_id) {
-              generatedId = ev.dashboard_id;
-            }
-          },
-          onDashboard: (dash) => {
-            generatedId = dash.id;
-            setActiveDashboard(dash);
-          },
-          onTurn: (turn) => {
-            if (turn.dashboard_id) generatedId = turn.dashboard_id;
-          },
-          onError: (err) => {
-            setGenError(`${err.code ? `[${err.code}] ` : ""}${err.message}`);
-          },
-        },
-        controller.signal
-      );
+    let targetDashId: string | null = mode === "edit" && activeDashboard ? activeDashboard.id : null;
+    const callbacks = {
+      onStep: (step: AgentStep) => {
+        setGenSteps((prev) => {
+          const idx = prev.findIndex((s) => s.id === step.id);
+          if (idx >= 0) {
+            const copy = [...prev];
+            copy[idx] = step;
+            return copy;
+          }
+          return [...prev, step];
+        });
+      },
+      onCanvas: (ev: { kind: string; dashboard_id?: string }) => {
+        if (ev.kind === "dashboard" && ev.dashboard_id) {
+          targetDashId = ev.dashboard_id;
+        }
+      },
+      onDashboard: (dash: DashboardDetail) => {
+        targetDashId = dash.id;
+        setActiveDashboard(dash);
+      },
+      onTurn: (turn: { dashboard_id: string | null; prompt_tokens: number; completion_tokens: number; cached_tokens?: number }) => {
+        if (turn.dashboard_id) targetDashId = turn.dashboard_id;
+        setLastGenTokens((turn.prompt_tokens || 0) + (turn.completion_tokens || 0));
+        if (turn.prompt_tokens > 0 && (turn.cached_tokens || 0) > 0) {
+          setLastGenCachePct(Math.round(((turn.cached_tokens || 0) / turn.prompt_tokens) * 100));
+        }
+      },
+      onError: (err: { code: string; message: string }) => {
+        setGenError(`${err.code ? `[${err.code}] ` : ""}${err.message}`);
+      },
+    };
 
-      await loadDashboards(generatedId);
+    try {
+      if (mode === "edit" && activeDashboard) {
+        await api.streamEditDashboard(activeDashboard.id, text, callbacks, controller.signal);
+      } else {
+        await api.streamGenerateDashboard(
+          { source_id: activeSource.id, prompt: text, theme: genTheme },
+          callbacks,
+          controller.signal
+        );
+      }
+      await loadDashboards(targetDashId);
+      setPrompt("");
     } catch (e) {
       if ((e as Error).name !== "AbortError") {
-        setGenError(e instanceof Error ? e.message : "AI 搭建看板失败");
+        setGenError(e instanceof Error ? e.message : "AI 执行失败");
       }
     } finally {
       abortRef.current = null;
       setIsGenerating(false);
+      onUsageChanged?.();
     }
   }
 
@@ -247,38 +276,79 @@ export function DashboardsPage({
     );
   }
 
+  const effectiveMode = aiMode === "edit" && activeDashboard ? "edit" : "create";
+
   return (
     <div className="h-full overflow-y-auto bg-slate-50/70 p-4 sm:p-6">
       <div className="mx-auto max-w-[1440px] space-y-5">
-        {/* Top AI One-Click Dashboard Generator */}
+        {/* Top AI Dashboard Studio (Create New OR Incrementally Edit Active) */}
         <div className="rounded-2xl border border-indigo-200/70 bg-gradient-to-br from-white via-white to-indigo-50/50 p-4 shadow-xs sm:p-5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-indigo-600 text-white shadow-xs">
-                <Sparkles className="h-4 w-4" />
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-600 to-violet-600 text-white shadow-xs">
+                {effectiveMode === "edit" ? (
+                  <Wand2 className="h-4 w-4" />
+                ) : (
+                  <Sparkles className="h-4 w-4" />
+                )}
               </div>
               <div>
-                <h2 className="text-sm font-bold text-slate-900">AI 一键搭建 12 列专业 BI 看板</h2>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-sm font-bold text-slate-900">
+                    {effectiveMode === "edit"
+                      ? `AI 增量修改「${activeDashboard?.name}」`
+                      : "AI 一键搭建 12 列专业 BI 看板"}
+                  </h2>
+                  {activeDashboard && (
+                    <div className="inline-flex rounded-lg bg-slate-100 p-0.5 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={() => setAiMode("create")}
+                        className={`rounded-md px-2 py-0.5 font-medium transition ${
+                          effectiveMode === "create"
+                            ? "bg-white text-indigo-700 shadow-2xs"
+                            : "text-slate-600 hover:text-slate-900"
+                        }`}
+                      >
+                        新建看板
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAiMode("edit")}
+                        className={`rounded-md px-2 py-0.5 font-medium transition ${
+                          effectiveMode === "edit"
+                            ? "bg-white text-violet-700 shadow-2xs"
+                            : "text-slate-600 hover:text-slate-900"
+                        }`}
+                      >
+                        增量修改当前
+                      </button>
+                    </div>
+                  )}
+                </div>
                 <p className="text-[11.5px] text-slate-500">
-                  Agent 自动执行多条只读 SQL 验证指标，组装 KPI 卡 + 双轴趋势 + 拆解图并配置 AST
-                  全局筛选器
+                  {effectiveMode === "edit"
+                    ? "用自然语言直接向当前看板增删改卡片或调整图表类型，无需推倒重建"
+                    : "Agent 自动执行多条只读 SQL 验证指标，组装 KPI 卡 + 双轴趋势 + 拆解图并配置 AST 全局筛选器"}
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5">
-              {QUICK_TEMPLATES.map((tpl) => (
-                <button
-                  key={tpl.name}
-                  type="button"
-                  disabled={isGenerating}
-                  onClick={() => void handleAiGenerate(tpl.prompt)}
-                  className="rounded-full border border-indigo-200 bg-white px-3 py-1 text-[11.5px] font-medium text-indigo-700 transition hover:bg-indigo-50 disabled:opacity-50"
-                >
-                  ⚡ {tpl.name}
-                </button>
-              ))}
-            </div>
+            {effectiveMode === "create" && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {QUICK_TEMPLATES.map((tpl) => (
+                  <button
+                    key={tpl.name}
+                    type="button"
+                    disabled={isGenerating}
+                    onClick={() => void handleAiSubmit(tpl.prompt, "create")}
+                    className="rounded-full border border-indigo-200 bg-white px-3 py-1 text-[11.5px] font-medium text-indigo-700 transition hover:bg-indigo-50 disabled:opacity-50"
+                  >
+                    ⚡ {tpl.name}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="mt-3.5 flex flex-col gap-2 sm:flex-row">
@@ -287,38 +357,44 @@ export function DashboardsPage({
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") void handleAiGenerate();
+                if (e.key === "Enter") void handleAiSubmit();
               }}
-              placeholder="描述你想搭建的专业看板（例如：电商月度经营分析大盘，含 KPI、趋势双轴图、品类排行与日期/品类筛选器）..."
+              placeholder={
+                effectiveMode === "edit"
+                  ? "描述要修改的内容（例如：再加一张按地区分布的横向条形图，并把最后一张图改成折线图）..."
+                  : "描述你想搭建的专业看板（例如：电商月度经营分析大盘，含 KPI、趋势双轴图、品类排行与日期/品类筛选器）..."
+              }
               className="flex-1 rounded-xl border border-slate-200 bg-white px-3.5 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/15"
             />
             <div className="flex shrink-0 items-center gap-2">
-              <div className="inline-flex rounded-xl border border-slate-200 bg-white p-0.5 text-xs">
-                <button
-                  type="button"
-                  onClick={() => setGenTheme("light")}
-                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
-                    genTheme === "light"
-                      ? "bg-slate-900 text-white"
-                      : "text-slate-600 hover:text-slate-900"
-                  }`}
-                >
-                  <Sun className="h-3 w-3" />
-                  亮色
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setGenTheme("dark")}
-                  className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
-                    genTheme === "dark"
-                      ? "bg-slate-900 text-white"
-                      : "text-slate-600 hover:text-slate-900"
-                  }`}
-                >
-                  <Moon className="h-3 w-3" />
-                  暗色大屏
-                </button>
-              </div>
+              {effectiveMode === "create" && (
+                <div className="inline-flex rounded-xl border border-slate-200 bg-white p-0.5 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setGenTheme("light")}
+                    className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
+                      genTheme === "light"
+                        ? "bg-slate-900 text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <Sun className="h-3 w-3" />
+                    亮色
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGenTheme("dark")}
+                    className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition ${
+                      genTheme === "dark"
+                        ? "bg-slate-900 text-white"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <Moon className="h-3 w-3" />
+                    暗色大屏
+                  </button>
+                </div>
+              )}
 
               {isGenerating ? (
                 <button
@@ -327,30 +403,54 @@ export function DashboardsPage({
                   className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white shadow-xs hover:bg-rose-500"
                 >
                   <Square className="h-3 w-3 fill-current" />
-                  停止生成
+                  停止执行
                 </button>
               ) : (
                 <button
                   type="button"
                   disabled={!prompt.trim()}
-                  onClick={() => void handleAiGenerate()}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-xs transition hover:bg-indigo-500 disabled:opacity-45"
+                  onClick={() => void handleAiSubmit()}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-white shadow-xs transition disabled:opacity-45 ${
+                    effectiveMode === "edit"
+                      ? "bg-violet-600 hover:bg-violet-500"
+                      : "bg-indigo-600 hover:bg-indigo-500"
+                  }`}
                 >
-                  <Sparkles className="h-3.5 w-3.5" />
-                  一键生成看板
+                  {effectiveMode === "edit" ? (
+                    <>
+                      <Wand2 className="h-3.5 w-3.5" />
+                      AI 增量更新
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="h-3.5 w-3.5" />
+                      一键生成看板
+                    </>
+                  )}
                 </button>
               )}
             </div>
           </div>
 
           {(genSteps.length > 0 || isGenerating) && (
-            <div className="mt-3">
+            <div className="mt-3 space-y-1.5">
               <AgentTraceTimeline
                 steps={genSteps}
                 isStreaming={isGenerating}
                 defaultExpanded
                 dialect={activeSource.dialect}
               />
+              {!isGenerating && lastGenTokens > 0 && (
+                <div className="flex items-center justify-end gap-2 font-mono text-[11px] text-slate-500">
+                  {lastGenCachePct > 0 && (
+                    <span className="inline-flex items-center gap-0.5 rounded bg-emerald-50 px-1.5 py-0.5 text-[10.5px] font-semibold text-emerald-700">
+                      <Zap className="h-2.5 w-2.5" />
+                      Prompt Cache 命中 {lastGenCachePct}%
+                    </span>
+                  )}
+                  <span>本次消耗 Tokens：{lastGenTokens.toLocaleString()}</span>
+                </div>
+              )}
             </div>
           )}
 
@@ -428,7 +528,7 @@ export function DashboardsPage({
                 全部刷新
               </button>
               <a
-                href={api.dashboardHtmlExportUrl(activeDashboard.id)}
+                href={api.dashboardHtmlExportUrl(activeDashboard.id, activeFilters)}
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1.5 rounded-xl bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white shadow-xs transition hover:bg-indigo-500"
@@ -461,8 +561,20 @@ export function DashboardsPage({
             )}
             <ProDashboardGrid
               dashboard={activeDashboard}
+              source={activeSource}
               dialect={activeSource.dialect}
-              onDashboardChange={setActiveDashboard}
+              onDashboardChange={(next) => {
+                setActiveDashboard(next);
+                setDashboards((prev) =>
+                  prev.map((d) =>
+                    d.id === next.id
+                      ? { ...d, name: next.name, description: next.description, card_count: next.cards.length }
+                      : d
+                  )
+                );
+              }}
+              onActiveFiltersChange={setActiveFilters}
+              onDrillDown={onDrillDownToWorkspace}
             />
           </div>
         ) : (

@@ -91,6 +91,26 @@ export interface TablePreviewResponse {
   truncated: boolean;
 }
 
+export interface SqlGuardWarningItem {
+  code: string;
+  severity: "info" | "warning" | "high" | string;
+  message: string;
+}
+
+export interface AdHocQueryResponse {
+  result_id: string;
+  source_id: string;
+  dialect: Dialect | string;
+  normalized_sql: string;
+  tables_used: string[];
+  warnings: SqlGuardWarningItem[];
+  columns: string[];
+  rows: Record<string, unknown>[];
+  row_count: number;
+  truncated: boolean;
+  duration_ms: number;
+}
+
 export interface ChartSpec {
   result_id?: string;
   chart_type: ChartType;
@@ -140,12 +160,14 @@ export interface TurnDetail {
   id: string;
   conversation_id: string;
   question: string;
-  status: "RUNNING" | "COMPLETED" | "FAILED" | string;
+  status: "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" | string;
   answer_md: string;
   artifacts: TurnArtifact[];
+  followups?: string[];
   dashboard_id: string | null;
   prompt_tokens: number;
   completion_tokens: number;
+  cached_tokens?: number;
   error_message: string | null;
   steps: AgentStep[];
   created_at: string;
@@ -270,6 +292,7 @@ export interface UsageTurnEntry {
   status: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cached_tokens?: number;
   created_at: string;
 }
 
@@ -279,6 +302,8 @@ export interface UsageSummary {
   avg_step_ms: number;
   prompt_tokens: number;
   completion_tokens: number;
+  cached_tokens?: number;
+  cache_hit_rate?: number;
   total_tokens: number;
   recent_turns: UsageTurnEntry[];
 }
@@ -290,6 +315,8 @@ export type CanvasEvent =
 export interface TurnStreamCallbacks {
   onStep?: (step: AgentStep) => void;
   onCanvas?: (event: CanvasEvent) => void;
+  onDelta?: (text: string) => void;
+  onDeltaReset?: () => void;
   onTurn?: (turn: TurnDetail) => void;
   onError?: (err: { code: string; message: string }) => void;
   onDone?: () => void;
@@ -315,6 +342,13 @@ const API_PREFIX = "/api";
 async function parseErrorResponse(res: Response): Promise<ApiError> {
   try {
     const data = await res.json();
+    if (data?.error && typeof data.error === "object") {
+      return new ApiError(
+        data.error.message || JSON.stringify(data.error),
+        data.error.code || "API_ERROR",
+        res.status
+      );
+    }
     const detail = data?.detail;
     if (typeof detail === "string") {
       return new ApiError(detail, data?.code || "HTTP_ERROR", res.status);
@@ -327,7 +361,7 @@ async function parseErrorResponse(res: Response): Promise<ApiError> {
       );
     }
     return new ApiError(
-      data?.message || data?.error || `请求失败 (${res.status})`,
+      data?.message || (typeof data?.error === "string" ? data.error : "") || `请求失败 (${res.status})`,
       data?.code || "HTTP_ERROR",
       res.status
     );
@@ -487,10 +521,21 @@ export const api = {
       body: JSON.stringify({ dictionary_md: dictionaryMd }),
     });
   },
+  generateDictionary(id: string): Promise<{ dictionary_md: string; prompt_tokens: number; completion_tokens: number }> {
+    return requestJson(`/sources/${encodeURIComponent(id)}/dictionary/generate`, {
+      method: "POST",
+    });
+  },
   previewTable(sourceId: string, tableName: string, limit = 50): Promise<TablePreviewResponse> {
     return requestJson(
       `/sources/${encodeURIComponent(sourceId)}/tables/${encodeURIComponent(tableName)}/preview?limit=${limit}`
     );
+  },
+  runSourceSql(sourceId: string, sql: string, limit = 500): Promise<AdHocQueryResponse> {
+    return requestJson(`/sources/${encodeURIComponent(sourceId)}/query`, {
+      method: "POST",
+      body: JSON.stringify({ sql, limit }),
+    });
   },
   deleteSource(id: string): Promise<void> {
     return requestJson(`/sources/${encodeURIComponent(id)}`, { method: "DELETE" });
@@ -509,6 +554,23 @@ export const api = {
   getConversation(id: string): Promise<ConversationDetail> {
     return requestJson(`/conversations/${encodeURIComponent(id)}`);
   },
+  renameConversation(id: string, title: string): Promise<ConversationDetail> {
+    return requestJson(`/conversations/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    });
+  },
+  cancelConversation(id: string): Promise<{ cancelled: boolean }> {
+    return requestJson(`/conversations/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    });
+  },
+  deleteTurnFromHere(conversationId: string, turnId: string): Promise<void> {
+    return requestJson(
+      `/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}`,
+      { method: "DELETE" }
+    );
+  },
   deleteConversation(id: string): Promise<void> {
     return requestJson(`/conversations/${encodeURIComponent(id)}`, { method: "DELETE" });
   },
@@ -524,6 +586,11 @@ export const api = {
       {
         step: (d) => callbacks.onStep?.(d as AgentStep),
         canvas: (d) => callbacks.onCanvas?.(d as CanvasEvent),
+        delta: (d) => {
+          const text = typeof d === "object" && d !== null ? String((d as { text?: string }).text || "") : String(d || "");
+          if (text) callbacks.onDelta?.(text);
+        },
+        delta_reset: () => callbacks.onDeltaReset?.(),
         turn: (d) => callbacks.onTurn?.(d as TurnDetail),
         error: (d) =>
           callbacks.onError?.(
@@ -609,6 +676,37 @@ export const api = {
       signal
     );
   },
+  streamEditDashboard(
+    dashboardId: string,
+    prompt: string,
+    callbacks: DashboardStreamCallbacks,
+    signal?: AbortSignal
+  ): Promise<void> {
+    return consumeSseStream(
+      `/dashboards/${encodeURIComponent(dashboardId)}/ai-edit/stream`,
+      { prompt },
+      {
+        step: (d) => callbacks.onStep?.(d as AgentStep),
+        canvas: (d) => callbacks.onCanvas?.(d as CanvasEvent),
+        dashboard: (d) => callbacks.onDashboard?.(d as DashboardDetail),
+        turn: (d) => callbacks.onTurn?.(d as TurnDetail),
+        error: (d) =>
+          callbacks.onError?.(
+            typeof d === "object" && d !== null
+              ? (d as { code: string; message: string })
+              : { code: "STREAM_ERROR", message: String(d) }
+          ),
+        done: () => callbacks.onDone?.(),
+      },
+      signal
+    );
+  },
+  reorderDashboardCards(dashboardId: string, cardIds: string[]): Promise<DashboardDetail> {
+    return requestJson(`/dashboards/${encodeURIComponent(dashboardId)}/cards/reorder`, {
+      method: "PUT",
+      body: JSON.stringify({ card_ids: cardIds }),
+    });
+  },
   addDashboardCard(
     dashboardId: string,
     payload: {
@@ -656,8 +754,12 @@ export const api = {
       body: JSON.stringify(payload || {}),
     });
   },
-  dashboardHtmlExportUrl(dashboardId: string): string {
-    return `${API_PREFIX}/dashboards/${encodeURIComponent(dashboardId)}/export/html`;
+  dashboardHtmlExportUrl(dashboardId: string, filterValues?: Record<string, unknown>): string {
+    const base = `${API_PREFIX}/dashboards/${encodeURIComponent(dashboardId)}/export/html`;
+    if (filterValues && Object.keys(filterValues).length > 0) {
+      return `${base}?filters=${encodeURIComponent(JSON.stringify(filterValues))}`;
+    }
+    return base;
   },
 
   // Settings

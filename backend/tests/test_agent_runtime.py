@@ -685,8 +685,9 @@ def test_registry_dashboard_and_baseline(sales_env):
         "analyze_stats",
         "render_chart",
         "build_dashboard",
+        "update_dashboard",
     }
-    assert len(registry.export_openai_tools()) == 5
+    assert len(registry.export_openai_tools()) == 6
 
     turn = db.create_turn(conv["id"], "测试工具")
     ctx = ToolContext(db=db, settings=settings, source=source, turn_id=turn["id"])
@@ -764,3 +765,184 @@ def test_registry_dashboard_and_baseline(sales_env):
     assert base_res["ok"] is True
     assert base_res["row_count"] == 1
     assert base_res["rows"][0]["total_orders"] == 18
+
+
+# ---------------------------------------------------------------------------
+# 7. New deterministic stats (pareto / trend / funnel / ab_test)
+# ---------------------------------------------------------------------------
+
+
+def test_expanded_deterministic_stats():
+    # Pareto ABC
+    pareto_rows = [
+        {"sku": "S1", "rev": 500},
+        {"sku": "S2", "rev": 300},
+        {"sku": "S3", "rev": 100},
+        {"sku": "S4", "rev": 60},
+        {"sku": "S5", "rev": 40},
+    ]
+    p = run_stats_analysis(pareto_rows, "pareto", {"dim_col": "sku", "metric_col": "rev"})
+    assert p["total"] == 1000.0
+    assert p["top_20pct_share_pct"] == 50.0
+    assert p["tiers"]["A"]["count"] == 2  # S1 (50%), S2 (cum 80%)
+
+    # Trend + moving average + forecast
+    trend_rows = [
+        {"m": "2025-01", "v": 100},
+        {"m": "2025-02", "v": 120},
+        {"m": "2025-03", "v": 140},
+        {"m": "2025-04", "v": 160},
+    ]
+    tr = run_stats_analysis(trend_rows, "trend", {"time_col": "m", "metric_col": "v", "forecast_steps": 2})
+    assert tr["direction"] == "上升趋势"
+    assert tr["slope_per_period"] == 20.0
+    assert tr["r_squared"] == 1.0
+    assert tr["forecasts"][0]["predicted"] == 180.0
+    assert tr["forecasts"][1]["predicted"] == 200.0
+
+    # Funnel conversion & biggest dropoff
+    funnel_rows = [
+        {"stage": "曝光", "cnt": 1000},
+        {"stage": "点击", "cnt": 400},
+        {"stage": "加购", "cnt": 100},
+        {"stage": "支付", "cnt": 50},
+    ]
+    fn = run_stats_analysis(funnel_rows, "funnel", {"stage_col": "stage", "count_col": "cnt"})
+    assert fn["overall_conv_pct"] == 5.0
+    assert fn["biggest_dropoff"]["from_stage"] == "点击"
+    assert fn["biggest_dropoff"]["to_stage"] == "加购"
+    assert fn["biggest_dropoff"]["dropoff_rate_pct"] == 75.0
+
+    # AB test (two-proportion Z-test)
+    ab_rows = [
+        {"grp": "control", "conv": 100, "total": 1000},
+        {"grp": "treatment", "conv": 150, "total": 1000},
+    ]
+    ab = run_stats_analysis(
+        ab_rows, "ab_test", {"group_col": "grp", "conv_col": "conv", "total_col": "total"}
+    )
+    assert ab["test_type"] == "two_proportion_z_test"
+    assert ab["relative_lift_pct"] == 50.0
+    assert ab["significant_at_95"] is True
+    assert ab["p_value"] < 0.01
+
+
+# ---------------------------------------------------------------------------
+# 8. Prompt Cache prefix freeze, cached_tokens, followups, cancel & update_dashboard
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_cache_freeze_followups_cancel_and_update_dashboard(sales_env):
+    import threading
+
+    from app.ai.client import _is_tool_unsupported, _usage
+
+    db, settings, source, conv = sales_env
+
+    # 1. Non-tool 400 error MUST NOT trigger tool fallback
+    assert _is_tool_unsupported(_Fake400Error("maximum context length exceeded")) is False
+    assert _is_tool_unsupported(_Fake400Error("model does not support tools")) is True
+
+    # 2. _usage parses both DeepSeek prompt_cache_hit_tokens & OpenAI prompt_tokens_details.cached_tokens
+    ds_comp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1000, completion_tokens=50, prompt_cache_hit_tokens=800))
+    assert _usage(ds_comp) == (1000, 50, 800)
+    oa_comp = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=1000, completion_tokens=60, prompt_tokens_details=SimpleNamespace(cached_tokens=750)
+        )
+    )
+    assert _usage(oa_comp) == (1000, 60, 750)
+
+    # 3. System prompt (messages[0]) stays 100% identical even when extra_system_hint changes
+    seen_sys_prompts: list[str] = []
+
+    class CacheSpyLLM:
+        provider = "mock"
+        model_name = "mock-cache"
+
+        def chat_with_tools(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]] | None = None,
+            temperature: float | None = None,
+            max_tokens: int | None = None,
+            *,
+            tool_choice: str = "auto",
+            on_text_delta=None,
+            cancel_event=None,
+        ) -> ToolTurnResponse:
+            seen_sys_prompts.append(messages[0]["content"])
+            return ToolTurnResponse(
+                final_answer='核心结论已完成。\n<!--FOLLOWUPS:["查看品类占比","做趋势预测"]-->',
+                prompt_tokens=1000,
+                completion_tokens=40,
+                cached_tokens=850,
+            )
+
+    t1 = run_agent_turn(db=db, settings=settings, source=source, conversation_id=conv["id"], question="问题1", llm_client=CacheSpyLLM())
+    t2 = run_agent_turn(
+        db=db,
+        settings=settings,
+        source=source,
+        conversation_id=conv["id"],
+        question="问题2",
+        llm_client=CacheSpyLLM(),
+        extra_system_hint="【动态看板任务指令 theme='dark'】",
+    )
+    assert seen_sys_prompts[0] == seen_sys_prompts[1]
+    assert t1["cached_tokens"] == 850
+    assert t1["followups"] == ["查看品类占比", "做趋势预测"]
+    assert "FOLLOWUPS" not in t1["answer_md"]
+    usage = db.get_usage_summary()
+    assert usage["cached_tokens"] == 1700
+    assert usage["cache_hit_rate"] == 85.0
+    assert t2["status"] == "COMPLETED"
+
+    # 4. Cooperative cancellation immediately aborts without calling LLM
+    cancel_ev = threading.Event()
+    cancel_ev.set()
+    t_cancel = run_agent_turn(
+        db=db,
+        settings=settings,
+        source=source,
+        conversation_id=conv["id"],
+        question="会被中止的问题",
+        llm_client=CacheSpyLLM(),
+        cancel_event=cancel_ev,
+    )
+    assert t_cancel["status"] == "CANCELLED"
+
+    # 5. update_dashboard tool incrementally adds & removes cards
+    registry = build_default_registry()
+    ctx = ToolContext(db=db, settings=settings, source=source, turn_id=t1["id"])
+    r1 = registry.invoke("run_sql", {"purpose": "渠道统计", "sql": "SELECT channel, COUNT(*) AS cnt FROM orders GROUP BY channel"}, ctx)
+    r2 = registry.invoke("run_sql", {"purpose": "大区统计", "sql": "SELECT region, COUNT(*) AS cnt FROM customers GROUP BY region"}, ctx)
+    built = registry.invoke(
+        "build_dashboard",
+        {
+            "name": "测试看板",
+            "cards": [{"title": "渠道图", "card_kind": "chart", "layout_span": 6, "result_id": r1.result_id}],
+        },
+        ctx,
+    )
+    assert built.ok and built.dashboard_id
+    dash_before = db.get_dashboard(built.dashboard_id)
+    orig_card_id = dash_before["cards"][0]["id"]
+
+    upd = registry.invoke(
+        "update_dashboard",
+        {
+            "dashboard_id": built.dashboard_id,
+            "name": "测试看板（已增量更新）",
+            "add_cards": [{"title": "大区图", "card_kind": "chart", "layout_span": 6, "result_id": r2.result_id}],
+            "update_cards": [{"card_id": orig_card_id, "title": "渠道图 v2", "layout_span": 12}],
+        },
+        ctx,
+    )
+    assert upd.ok
+    dash_after = db.get_dashboard(built.dashboard_id)
+    assert dash_after["name"] == "测试看板（已增量更新）"
+    assert dash_after["card_count"] == 2
+    assert dash_after["cards"][0]["title"] == "渠道图 v2"
+    assert dash_after["cards"][0]["layout_span"] == 12
+    assert dash_after["cards"][1]["title"] == "大区图"

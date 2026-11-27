@@ -195,6 +195,7 @@ class ToolTurnResponse(BaseModel):
     final_answer: str | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cached_tokens: int = 0
     duration_ms: int = 0
     used_fallback_json: bool = False
 

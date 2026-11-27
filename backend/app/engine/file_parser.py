@@ -14,7 +14,7 @@ from charset_normalizer import from_bytes
 
 from app.models import ValidationError
 
-SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".json", ".jsonl", ".parquet"}
+SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".jsonl", ".parquet"}
 
 
 @dataclass
@@ -110,6 +110,11 @@ def _detect_csv_encoding(raw_bytes: bytes) -> str:
 
 
 def _detect_delimiter(text_sample: str, default: str = ",") -> str:
+    first_line = next((ln for ln in text_sample.splitlines() if ln.strip()), "")
+    if default == "," and first_line.count(",") >= 1 and first_line.count("\t") == 0:
+        return ","
+    if default == "\t" and first_line.count("\t") >= 1:
+        return "\t"
     try:
         dialect = csv.Sniffer().sniff(text_sample, delimiters=",\t;|")
         return dialect.delimiter
@@ -307,7 +312,10 @@ def _parse_excel_sheets(
             staged_parquet = staged_dir / f"{physical_name}.parquet"
             results.append(
                 _stage_and_profile_with_duckdb(
-                    source_expr=f"read_csv_auto('{csv_lit}', header=true, all_varchar=false)",
+                    source_expr=(
+                        f"read_csv_auto('{csv_lit}', header=true, delim=',', quote='\"', "
+                        "escape='\"', strict_mode=false, all_varchar=false)"
+                    ),
                     staging_parquet=staged_parquet,
                     physical_name=physical_name,
                     display_name=display_name,
@@ -337,7 +345,7 @@ def parse_file_to_staged_tables(
         )
 
     staged_dir.mkdir(parents=True, exist_ok=True)
-    if ext == ".xlsx":
+    if ext in {".xlsx", ".xls"}:
         return _parse_excel_sheets(file_path, staged_dir, used_table_names)
 
     physical_name = _unique_table_name(file_path.stem, used_table_names)
@@ -351,7 +359,8 @@ def parse_file_to_staged_tables(
         encoding = _detect_csv_encoding(raw_bytes)
         text = raw_bytes.decode(encoding, errors="replace")
         delimiter = _detect_delimiter(text[:8192], default="\t" if ext == ".tsv" else ",")
-        all_rows = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+        csv.field_size_limit(min(10 * 1024 * 1024, max(csv.field_size_limit(), 10 * 1024 * 1024)))
+        all_rows = [r for r in csv.reader(io.StringIO(text), delimiter=delimiter) if any(c.strip() for c in r)]
         if len(all_rows) < 2:
             raise ValidationError(f"CSV 文件 {file_path.name} 至少需要表头和一行数据")
         headers = _dedupe_names(all_rows[0])
@@ -361,7 +370,10 @@ def parse_file_to_staged_tables(
             csv_lit = str(temp_utf8).replace("'", "''")
             return [
                 _stage_and_profile_with_duckdb(
-                    source_expr=f"read_csv_auto('{csv_lit}', header=true, sample_size=20000)",
+                    source_expr=(
+                        f"read_csv_auto('{csv_lit}', header=true, delim=',', quote='\"', "
+                        "escape='\"', sample_size=50000, strict_mode=false)"
+                    ),
                     staging_parquet=staged_parquet,
                     physical_name=physical_name,
                     display_name=display_name,

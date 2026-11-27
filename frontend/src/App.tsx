@@ -38,6 +38,7 @@ export default function App() {
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [activeSource, setActiveSource] = useState<SourceDetail | null>(null);
   const [jumpDashboardId, setJumpDashboardId] = useState<string | null>(null);
+  const [drillDownPrompt, setDrillDownPrompt] = useState<string | null>(null);
 
   // Settings Modal Drawer state
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -52,8 +53,8 @@ export default function App() {
   const [formBaseUrl, setFormBaseUrl] = useState("https://api.deepseek.com/v1");
   const [formModel, setFormModel] = useState("deepseek-chat");
   const [formApiKey, setFormApiKey] = useState("");
-  const [formTemperature, setFormTemperature] = useState(0.1);
-  const [formMaxSteps, setFormMaxSteps] = useState(8);
+  const [formTemperature, setFormTemperature] = useState("0.1");
+  const [formMaxSteps, setFormMaxSteps] = useState("8");
   const [savingProfile, setSavingProfile] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, LLMTestResult>>({});
@@ -96,10 +97,25 @@ export default function App() {
     }
   }
 
+  async function refreshUsage() {
+    try {
+      const uSummary = await api.getUsage();
+      setUsage(uSummary);
+    } catch {
+      // ignore
+    }
+  }
+
   useEffect(() => {
     void refreshSources();
     void refreshSettings();
   }, []);
+
+  useEffect(() => {
+    if (settingsOpen) {
+      void refreshUsage();
+    }
+  }, [settingsOpen, settingsTab]);
 
   useEffect(() => {
     if (!activeSourceId) {
@@ -131,8 +147,24 @@ export default function App() {
     setFormModel(preset.default_model);
   }
 
+  function normalizeMaxSteps(raw: string): number {
+    const parsed = parseInt(raw.trim(), 10);
+    if (!Number.isFinite(parsed)) return 8;
+    return Math.max(2, Math.min(20, parsed));
+  }
+
+  function normalizeTemperature(raw: string): number {
+    const parsed = parseFloat(raw.trim());
+    if (!Number.isFinite(parsed)) return 0.1;
+    return Math.round(Math.max(0, Math.min(2, parsed)) * 100) / 100;
+  }
+
   async function handleSaveProfile() {
     if (!formBaseUrl.trim() || !formModel.trim()) return;
+    const safeMaxSteps = normalizeMaxSteps(formMaxSteps);
+    const safeTemp = normalizeTemperature(formTemperature);
+    setFormMaxSteps(String(safeMaxSteps));
+    setFormTemperature(String(safeTemp));
     setSavingProfile(true);
     setSettingsError(null);
     try {
@@ -142,9 +174,9 @@ export default function App() {
         base_url: formBaseUrl.trim(),
         model_name: formModel.trim(),
         api_key: formApiKey.trim(),
-        temperature: formTemperature,
+        temperature: safeTemp,
         max_tokens: 2048,
-        max_steps: formMaxSteps,
+        max_steps: safeMaxSteps,
         activate: true,
       });
       setFormApiKey("");
@@ -306,17 +338,20 @@ export default function App() {
       </aside>
 
       {/* Main Page Area */}
-      <main className="h-full flex-1 overflow-hidden">
+      <main className="h-full min-w-0 flex-1 overflow-hidden">
         {navTab === "workspace" && (
           <WorkspacePage
             activeSource={activeSource}
             hasActiveModel={Boolean(activeProfile)}
+            initialPrompt={drillDownPrompt}
+            onConsumeInitialPrompt={() => setDrillDownPrompt(null)}
             onGoDataPage={() => setNavTab("data")}
             onOpenDashboardInLibrary={(dashId) => {
               setJumpDashboardId(dashId);
               setNavTab("dashboards");
             }}
             onOpenSettings={() => setSettingsOpen(true)}
+            onUsageChanged={() => void refreshUsage()}
           />
         )}
 
@@ -326,6 +361,11 @@ export default function App() {
             initialDashboardId={jumpDashboardId}
             onConsumeInitialDashboardId={() => setJumpDashboardId(null)}
             onGoDataPage={() => setNavTab("data")}
+            onDrillDownToWorkspace={(promptText) => {
+              setDrillDownPrompt(promptText);
+              setNavTab("workspace");
+            }}
+            onUsageChanged={() => void refreshUsage()}
           />
         )}
 
@@ -584,28 +624,41 @@ export default function App() {
                       <div className="grid grid-cols-2 gap-2.5">
                         <div>
                           <label className="mb-1 block text-[11px] font-medium text-slate-600">
-                            Agent 最大推理步数 (max_steps)
+                            Agent 最大推理步数 (2–20)
                           </label>
                           <input
-                            type="number"
-                            min={2}
-                            max={20}
+                            type="text"
+                            inputMode="numeric"
                             value={formMaxSteps}
-                            onChange={(e) => setFormMaxSteps(Number(e.target.value) || 8)}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (v === "" || /^\d{0,2}$/.test(v)) {
+                                setFormMaxSteps(v);
+                              }
+                            }}
+                            onBlur={() => setFormMaxSteps(String(normalizeMaxSteps(formMaxSteps)))}
+                            placeholder="8"
                             className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs focus:border-indigo-500 focus:outline-none"
                           />
                         </div>
                         <div>
                           <label className="mb-1 block text-[11px] font-medium text-slate-600">
-                            Temperature
+                            Temperature (0–2.0)
                           </label>
                           <input
-                            type="number"
-                            min={0}
-                            max={1}
-                            step={0.05}
+                            type="text"
+                            inputMode="decimal"
                             value={formTemperature}
-                            onChange={(e) => setFormTemperature(Number(e.target.value))}
+                            onChange={(e) => {
+                              const v = e.target.value;
+                              if (v === "" || /^\d*\.?\d*$/.test(v)) {
+                                setFormTemperature(v);
+                              }
+                            }}
+                            onBlur={() =>
+                              setFormTemperature(String(normalizeTemperature(formTemperature)))
+                            }
+                            placeholder="0.1"
                             className="w-full rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-mono text-xs focus:border-indigo-500 focus:outline-none"
                           />
                         </div>
@@ -647,11 +700,17 @@ export default function App() {
                       <div className="mt-1 font-mono text-xl font-bold text-indigo-700">
                         {(usage?.total_tokens ?? 0).toLocaleString()}
                       </div>
+                      <div className="mt-0.5 font-mono text-[10.5px] text-slate-400">
+                        输入 {(usage?.prompt_tokens ?? 0).toLocaleString()} · 输出 {(usage?.completion_tokens ?? 0).toLocaleString()}
+                      </div>
                     </div>
-                    <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-3.5">
-                      <div className="text-[11px] text-slate-500">平均单步耗时</div>
-                      <div className="mt-1 font-mono text-xl font-bold text-slate-900">
-                        {usage?.avg_step_ms ?? 0} ms
+                    <div className="rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-3.5">
+                      <div className="text-[11px] text-emerald-700">Prompt Cache 命中率</div>
+                      <div className="mt-1 font-mono text-xl font-bold text-emerald-700">
+                        {(usage?.cache_hit_rate ?? 0).toFixed(1)}%
+                      </div>
+                      <div className="mt-0.5 font-mono text-[10.5px] text-emerald-600/80">
+                        已命中 {(usage?.cached_tokens ?? 0).toLocaleString()} prompt tok · 均值 {usage?.avg_step_ms ?? 0}ms/步
                       </div>
                     </div>
                   </div>
@@ -664,19 +723,32 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="divide-y divide-slate-100 rounded-xl border border-slate-200">
-                        {usage.recent_turns.map((t) => (
-                          <div
-                            key={t.id}
-                            className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
-                          >
-                            <div className="min-w-0 flex-1 truncate text-slate-800">
-                              {t.question}
+                        {usage.recent_turns.map((t) => {
+                          const hitPct =
+                            t.prompt_tokens > 0 && (t.cached_tokens ?? 0) > 0
+                              ? Math.round(((t.cached_tokens ?? 0) / t.prompt_tokens) * 100)
+                              : 0;
+                          return (
+                            <div
+                              key={t.id}
+                              className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs"
+                            >
+                              <div className="min-w-0 flex-1 truncate text-slate-800">
+                                {t.question}
+                              </div>
+                              <div className="flex shrink-0 items-center gap-2 font-mono text-[11px]">
+                                {hitPct > 0 && (
+                                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                                    缓存 {hitPct}%
+                                  </span>
+                                )}
+                                <span className="text-slate-500">
+                                  {(t.prompt_tokens + t.completion_tokens).toLocaleString()} tok
+                                </span>
+                              </div>
                             </div>
-                            <div className="shrink-0 font-mono text-[11px] text-slate-500">
-                              {(t.prompt_tokens + t.completion_tokens).toLocaleString()} tok
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     )}
                   </div>

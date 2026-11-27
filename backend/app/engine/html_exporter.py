@@ -83,7 +83,10 @@ def _md_to_html(md_text: str) -> str:
         s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
         return re.sub(r"\*([^*]+)\*", r"<em>\1</em>", re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s))
 
-    for raw in md_text.replace("\r\n", "\n").split("\n"):
+    raw_lines = md_text.replace("\r\n", "\n").split("\n")
+    idx = 0
+    while idx < len(raw_lines):
+        raw = raw_lines[idx]
         s = raw.strip()
         if s.startswith("```"):
             close_list()
@@ -91,14 +94,40 @@ def _md_to_html(md_text: str) -> str:
                 out.append(f"<pre><code>{html.escape(chr(10).join(code_buf))}</code></pre>")
                 code_buf.clear()
             in_code = not in_code
+            idx += 1
         elif in_code:
             code_buf.append(raw)
+            idx += 1
+        elif (
+            "|" in s
+            and idx + 1 < len(raw_lines)
+            and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", raw_lines[idx + 1])
+        ):
+            close_list()
+
+            def _split_row(line_str: str) -> list[str]:
+                return [c.strip() for c in re.sub(r"^\||\|$", "", line_str.strip()).split("|")]
+
+            headers = _split_row(s)
+            body_rows: list[list[str]] = []
+            idx += 2
+            while idx < len(raw_lines) and "|" in raw_lines[idx].strip():
+                body_rows.append(_split_row(raw_lines[idx]))
+                idx += 1
+            ths = "".join(f"<th>{inline(h)}</th>" for h in headers)
+            trs = "".join(
+                "<tr>" + "".join(f"<td>{inline(r[ci] if ci < len(r) else '')}</td>" for ci in range(len(headers))) + "</tr>"
+                for r in body_rows
+            )
+            out.append(f"<div class='table-wrap'><table><thead><tr>{ths}</tr></thead><tbody>{trs}</tbody></table></div>")
         elif not s:
             close_list()
+            idx += 1
         elif m := re.match(r"^(#{1,4})\s+(.*)$", s):
             close_list()
             lvl = min(len(m.group(1)) + 1, 5)
             out.append(f"<h{lvl}>{inline(m.group(2))}</h{lvl}>")
+            idx += 1
         elif m := re.match(r"^(?:([-*•])|(\d+\.))\s+(.*)$", s):
             want = "ul" if m.group(1) else "ol"
             if list_tag != want:
@@ -106,9 +135,11 @@ def _md_to_html(md_text: str) -> str:
                 out.append(f"<{want}>")
                 list_tag = want
             out.append(f"<li>{inline(m.group(3))}</li>")
+            idx += 1
         else:
             close_list()
             out.append(f"<p>{inline(s)}</p>")
+            idx += 1
     if in_code and code_buf:
         out.append(f"<pre><code>{html.escape(chr(10).join(code_buf))}</code></pre>")
     close_list()
@@ -147,6 +178,7 @@ def _theme_css(theme: str) -> str:
         ".table-wrap{overflow-x:auto;margin-top:8px;border:1px solid var(--bd);border-radius:8px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:7px 10px;border-bottom:1px solid var(--bd);text-align:left;white-space:nowrap}th{background:var(--code);font-weight:600}"
         ".table-note,.muted,.empty-state{color:var(--muted);font-size:12px;padding:6px 0}.ref-pill{display:inline-block;padding:1px 6px;border-radius:6px;background:var(--pill);color:var(--acc);font-family:monospace;font-size:11px}"
         ".section{margin-bottom:22px}.section-title{font-size:16px;font-weight:700;margin:0 0 12px}.trace-item{padding:10px 12px;border:1px solid var(--bd);border-radius:10px;margin-bottom:8px;background:var(--card);font-size:13px}.footer{margin-top:32px;text-align:center;color:var(--muted);font-size:12px}"
+        "@media print{body{background:#fff;color:#0f172a}.card{box-shadow:none;break-inside:avoid}details{display:none}}"
     )
 
 
@@ -167,7 +199,8 @@ function renderChart(elId,spec,rawRows,theme){
   if(!rows.length){el.innerHTML='<div class="empty-state">当前筛选条件下暂无数据</div>';return;}
   if(ct==='kpi_card'){
     const r=rows[0]||{},hasD=spec.delta_col&&r[spec.delta_col]!=null,dn=hasD?num(r[spec.delta_col]):0;
-    const dHtml=hasD?`<div class="kpi-delta ${dn>0?'delta-up':dn<0?'delta-down':'delta-flat'}">${dn>0?'▲':dn<0?'▼':'•'} ${dn>0?'+':''}${esc(r[spec.delta_col])}${spec.delta_label?' '+esc(spec.delta_label):''}</div>`:'';
+    const dPct=hasD&&Math.abs(dn)<=1.5&&!String(r[spec.delta_col]).includes('%')?(dn*100).toFixed(2)+'%':`${dn.toFixed(2)}%`;
+    const dHtml=hasD?`<div class="kpi-delta ${dn>0?'delta-up':dn<0?'delta-down':'delta-flat'}">${dn>0?'▲':dn<0?'▼':'•'} ${dn>0?'+':''}${esc(dPct)}${spec.delta_label?' '+esc(spec.delta_label):''}</div>`:'';
     el.innerHTML=`<div class="kpi-box"><div class="kpi-value">${esc(fmt(r[spec.y],spec.unit||''))}</div>${dHtml}${spec.metric_note?`<div class="kpi-note">${esc(spec.metric_note)}</div>`:''}</div>`;return;
   }
   if(typeof echarts==='undefined'){el.innerHTML='<div class="empty-state">未能加载 ECharts CDN，请联网查看图表</div>';return;}

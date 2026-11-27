@@ -198,3 +198,32 @@ def test_sql_guard_four_layers(demo_source: SourceDetail) -> None:
     scalar = validate_sql("SELECT COUNT(*) AS cnt FROM orders", tables, rels, max_rows=250)
     assert scalar.ok
     assert not any(w.code == "AUTO_LIMIT_APPLIED" for w in scalar.warnings)
+
+
+def test_source_adhoc_sql_query_endpoint(demo_source: SourceDetail, client: TestClient) -> None:
+    ok_resp = client.post(
+        f"/api/sources/{demo_source.id}/query",
+        json={
+            "sql": "SELECT channel, COUNT(*) AS order_cnt FROM orders GROUP BY channel ORDER BY order_cnt DESC",
+            "limit": 100,
+        },
+    )
+    assert ok_resp.status_code == 200
+    data = ok_resp.json()
+    assert data["result_id"].startswith("res_")
+    assert data["row_count"] == 3
+    assert data["columns"] == ["channel", "order_cnt"]
+    assert "SELECT" in data["normalized_sql"].upper()
+
+    # Persisted result is exportable as CSV
+    csv_resp = client.get(f"/api/results/{data['result_id']}/csv")
+    assert csv_resp.status_code == 200
+    assert "channel,order_cnt" in csv_resp.text
+
+    # Write statements must be blocked by AST firewall
+    bad_resp = client.post(
+        f"/api/sources/{demo_source.id}/query",
+        json={"sql": "DROP TABLE orders"},
+    )
+    assert bad_resp.status_code == 400
+    assert bad_resp.json()["error"]["code"] == "WRITE_OR_ADMIN_DENIED"

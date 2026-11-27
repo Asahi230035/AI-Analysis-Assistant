@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import threading
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,14 @@ class AIGenerateDashboardRequest(BaseModel):
     source_id: str = Field(..., min_length=1)
     prompt: str = Field(..., min_length=1, max_length=2000)
     theme: DashboardTheme = "light"
+
+
+class AIEditDashboardRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=2000)
+
+
+class ReorderCardsRequest(BaseModel):
+    card_ids: list[str] = Field(..., min_length=1)
 
 
 class AddCardRequest(BaseModel):
@@ -284,6 +293,7 @@ def create_dashboard(
 @router.post("/ai-generate/stream")
 def ai_generate_dashboard_stream(
     body: AIGenerateDashboardRequest,
+    request: Request,
     settings: AppSettings = Depends(get_settings),
     db: Database = Depends(get_db),
     llm_client: LLMClientProtocol | None = Depends(get_active_llm),
@@ -312,6 +322,89 @@ def ai_generate_dashboard_stream(
         "3. 最后用简洁中文总结该看板覆盖的核心指标、筛选能力与主要业务发现（所有数字附带 [ref:res_xxx]）。"
     )
 
+    return _stream_dashboard_agent(
+        request=request,
+        db=db,
+        settings=settings,
+        source=source,
+        conversation_id=conv["id"],
+        prompt=prompt,
+        llm_client=llm_client,
+        extra_hint=extra_hint,
+        default_dashboard_id=None,
+    )
+
+
+@router.post("/{dashboard_id}/ai-edit/stream")
+def ai_edit_dashboard_stream(
+    dashboard_id: str,
+    body: AIEditDashboardRequest,
+    request: Request,
+    settings: AppSettings = Depends(get_settings),
+    db: Database = Depends(get_db),
+    llm_client: LLMClientProtocol | None = Depends(get_active_llm),
+) -> StreamingResponse:
+    prompt = body.prompt.strip()
+    if not prompt:
+        raise ValidationError("看板修改指令不能为空。")
+    if llm_client is None:
+        raise AppError(
+            "LLM_NOT_CONFIGURED",
+            "尚未配置或启用大语言模型，请先在「模型设置」中添加并激活 LLM 配置。",
+            status_code=400,
+        )
+
+    dash = db.get_dashboard(dashboard_id)
+    source = db.get_source(dash["source_id"])
+    conv = db.create_conversation(source.id, title=f"[AI改看板] {prompt[:32]}")
+
+    card_lines = [
+        f"  - card_id=`{c['id']}` | 位置={c['position']} | 宽={c['layout_span']}列 | 类型={c['card_kind']} / "
+        f"{(c.get('chart_spec') or {}).get('chart_type', 'table')} | 标题=「{c['title']}」 | result_id=`{c.get('result_id') or ''}`"
+        for c in dash.get("cards") or []
+    ]
+    filter_lines = [
+        f"  - id=`{f['id']}` | {f['label']} ({f['filter_type']} -> {f['target_table']}.{f['target_column']})"
+        for f in dash.get("global_filters") or []
+    ]
+    extra_hint = (
+        f"【当前任务：对已有专业看板 `{dash['id']}`（「{dash['name']}」，主题 `{dash['theme']}`）进行增量修改】\n"
+        "现有卡片清单：\n"
+        + ("\n".join(card_lines) if card_lines else "  （当前暂无卡片）")
+        + "\n现有全局筛选器：\n"
+        + ("\n".join(filter_lines) if filter_lines else "  （当前无筛选器）")
+        + "\n执行要求：\n"
+        "1. 如需新增或替换数据指标，先调用 `run_sql` 执行只读 SQL 获取新的 `result_id`；若仅改图表类型/标题/跨度，可直接复用原卡片或无需重查。\n"
+        f"2. 务必调用 `update_dashboard(dashboard_id='{dash['id']}', ...)` 进行增量增删改，不要新建重复看板！\n"
+        "3. 最后简明总结对看板做了哪些变更。"
+    )
+
+    return _stream_dashboard_agent(
+        request=request,
+        db=db,
+        settings=settings,
+        source=source,
+        conversation_id=conv["id"],
+        prompt=prompt,
+        llm_client=llm_client,
+        extra_hint=extra_hint,
+        default_dashboard_id=dash["id"],
+    )
+
+
+def _stream_dashboard_agent(
+    *,
+    request: Request,
+    db: Database,
+    settings: AppSettings,
+    source: Any,
+    conversation_id: str,
+    prompt: str,
+    llm_client: LLMClientProtocol,
+    extra_hint: str,
+    default_dashboard_id: str | None,
+) -> StreamingResponse:
+    cancel_event = threading.Event()
     event_queue: queue.Queue[tuple[str, Any] | None] = queue.Queue()
 
     def _worker() -> None:
@@ -330,15 +423,16 @@ def ai_generate_dashboard_stream(
                 db=db,
                 settings=settings,
                 source=source,
-                conversation_id=conv["id"],
+                conversation_id=conversation_id,
                 question=prompt,
                 llm_client=llm_client,
                 max_steps=12,
                 max_sql_runs=9,
                 on_event=_on_event,
                 extra_system_hint=extra_hint,
+                cancel_event=cancel_event,
             )
-            dash_id = turn.get("dashboard_id")
+            dash_id = turn.get("dashboard_id") or default_dashboard_id
             if dash_id:
                 hydrated = hydrate_dashboard(db, db.get_dashboard(dash_id))
                 event_queue.put(("dashboard", hydrated))
@@ -350,23 +444,36 @@ def ai_generate_dashboard_stream(
             failed = True
             event_queue.put(("error", {"code": "DASHBOARD_GEN_ERROR", "message": str(exc)}))
         finally:
-            event_queue.put(("done", {"ok": not failed}))
+            event_queue.put(("done", {"ok": not failed, "cancelled": cancel_event.is_set()}))
             event_queue.put(None)
 
     thread = threading.Thread(target=_worker, daemon=True)
     thread.start()
 
-    def _event_stream() -> Iterator[str]:
-        while True:
-            try:
-                item = event_queue.get(timeout=15.0)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if item is None:
-                break
-            evt, payload = item
-            yield _sse_line(evt, payload)
+    async def _event_stream() -> AsyncIterator[str]:
+        idle_ticks = 0
+        try:
+            while True:
+                if await request.is_disconnected():
+                    cancel_event.set()
+                    break
+                try:
+                    item = event_queue.get_nowait()
+                    idle_ticks = 0
+                except queue.Empty:
+                    idle_ticks += 1
+                    if idle_ticks >= 50:
+                        idle_ticks = 0
+                        yield ": keepalive\n\n"
+                    await asyncio.sleep(0.05 if idle_ticks < 20 else 0.25)
+                    continue
+                if item is None:
+                    break
+                evt, payload = item
+                yield _sse_line(evt, payload)
+        finally:
+            if thread.is_alive():
+                cancel_event.set()
 
     return StreamingResponse(
         _event_stream(),
@@ -390,6 +497,13 @@ def update_dashboard_card(
     source = db.get_source(existing["source_id"])
 
     formatted_sql: str | None = None
+    new_result_id: str | None = None
+    new_chart_spec: dict[str, Any] | None = (
+        body.chart_spec.model_dump() if body.chart_spec is not None else None
+    )
+    refreshed_at: str | None = None
+    refresh_err: str | None = "__KEEP__"
+
     if body.sql_text is not None:
         guard = validate_sql(
             body.sql_text,
@@ -405,6 +519,43 @@ def update_dashboard_card(
                 status_code=400,
             )
         formatted_sql = guard.normalized_sql
+        if formatted_sql != existing["sql_text"]:
+            try:
+                qr = execute_readonly_sql(
+                    source.dialect,
+                    source.db_path,
+                    formatted_sql,
+                    limit=settings.max_result_rows,
+                    timeout_sec=settings.query_timeout_sec,
+                )
+                facts = extract_facts(qr)
+                saved = db.save_query_result(
+                    source_id=source.id,
+                    sql_text=formatted_sql,
+                    dialect=source.dialect,
+                    columns=qr.columns,
+                    rows=qr.rows,
+                    row_count=qr.row_count,
+                    truncated=qr.truncated,
+                    facts=facts,
+                )
+                new_result_id = saved["id"]
+                refreshed_at = utc_now()
+                refresh_err = None
+                effective_kind = body.card_kind or existing["card_kind"]
+                if effective_kind != "table":
+                    raw_spec = new_chart_spec or existing.get("chart_spec")
+                    parsed_spec = ChartSpec.model_validate(raw_spec) if raw_spec else None
+                    norm_spec = validate_and_normalize_chart_spec(
+                        parsed_spec,
+                        qr,
+                        new_result_id,
+                        fallback_title=(body.title.strip() if body.title else existing["title"]),
+                    )
+                    if norm_spec is not None:
+                        new_chart_spec = norm_spec.model_dump()
+            except Exception as exc:
+                raise AppError("SQL_EXECUTION_ERROR", f"修改后的 SQL 执行失败：{exc}", status_code=400) from exc
 
     updated = db.update_dashboard_card(
         card_id,
@@ -414,7 +565,10 @@ def update_dashboard_card(
         layout_span=body.layout_span,
         position=body.position,
         sql_text=formatted_sql,
-        chart_spec=body.chart_spec.model_dump() if body.chart_spec is not None else None,
+        chart_spec=new_chart_spec,
+        result_id=new_result_id,
+        last_refreshed_at=refreshed_at,
+        refresh_error=refresh_err,
     )
     if updated.get("result_id"):
         try:
@@ -513,6 +667,16 @@ def add_dashboard_card(
     card["facts"] = qr_dict["facts"]
     card["applied_filters"] = []
     return card
+
+
+@router.put("/{dashboard_id}/cards/reorder")
+def reorder_dashboard_cards_endpoint(
+    dashboard_id: str,
+    body: ReorderCardsRequest,
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    updated = db.reorder_dashboard_cards(dashboard_id, body.card_ids)
+    return hydrate_dashboard(db, updated)
 
 
 @router.post("/{dashboard_id}/refresh")
